@@ -1,0 +1,12 @@
+[package]
+name = "ddbcore-testkit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Engine-agnostic contract tests for DDBCore Connection adapters"
+
+[dependencies]
+ddbcore.workspace = true
+futures.workspace = true

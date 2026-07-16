@@ -21,3 +21,7 @@ rust_decimal = { workspace = true, features = ["db-postgres"] }
 tokio.workspace = true
 tracing.workspace = true
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "rust_decimal"] }
+
+[dev-dependencies]
+ddbcore-testkit = { path = "../ddbcore-testkit" }
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }

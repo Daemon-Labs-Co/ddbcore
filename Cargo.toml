@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ddbcore", "crates/ddbcore-postgres"]
+members = ["crates/ddbcore", "crates/ddbcore-postgres", "crates/ddbcore-testkit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,3 +23,4 @@ rust_decimal = { version = "1", features = ["serde-str"] }
 tracing = "0.1"
 
 ddbcore = { path = "crates/ddbcore" }
+ddbcore-testkit = { path = "crates/ddbcore-testkit" }

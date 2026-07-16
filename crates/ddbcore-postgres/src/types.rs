@@ -74,3 +74,73 @@ fn parse_precision_scale(args: &str) -> (Option<u32>, Option<u32>) {
     let mut parts = args.split(',').map(|s| s.trim().parse().ok());
     (parts.next().flatten(), parts.next().flatten())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn map(native: &str) -> TypeCategory {
+        map_pg_type(native, &HashMap::new())
+    }
+
+    #[test]
+    fn maps_simple_scalars() {
+        assert_eq!(map("boolean"), TypeCategory::Boolean);
+        assert_eq!(map("integer"), TypeCategory::Integer);
+        assert_eq!(map("bigint"), TypeCategory::BigInt);
+        assert_eq!(map("text"), TypeCategory::Text);
+        assert_eq!(map("uuid"), TypeCategory::Uuid);
+        assert_eq!(map("jsonb"), TypeCategory::Json);
+    }
+
+    #[test]
+    fn maps_numeric_with_precision_and_scale() {
+        assert_eq!(map("numeric(10,2)"), TypeCategory::Decimal { precision: Some(10), scale: Some(2) });
+        assert_eq!(map("numeric"), TypeCategory::Decimal { precision: None, scale: None });
+    }
+
+    #[test]
+    fn maps_varchar_with_length() {
+        assert_eq!(map("character varying(255)"), TypeCategory::VarChar { length: Some(255) });
+        assert_eq!(map("character varying"), TypeCategory::VarChar { length: None });
+    }
+
+    #[test]
+    fn maps_timestamp_variants() {
+        assert_eq!(
+            map("timestamp without time zone"),
+            TypeCategory::Timestamp { precision: None, with_timezone: false }
+        );
+        assert_eq!(
+            map("timestamp(3) with time zone"),
+            TypeCategory::Timestamp { precision: Some(3), with_timezone: true }
+        );
+        assert_eq!(map("time without time zone"), TypeCategory::Time { precision: None });
+    }
+
+    #[test]
+    fn maps_arrays_recursively() {
+        assert_eq!(map("integer[]"), TypeCategory::Array { element: Box::new(TypeCategory::Integer) });
+        assert_eq!(
+            map("character varying(50)[]"),
+            TypeCategory::Array { element: Box::new(TypeCategory::VarChar { length: Some(50) }) }
+        );
+    }
+
+    #[test]
+    fn maps_known_enum_type() {
+        let mut enums = HashMap::new();
+        enums.insert("mood".to_string(), vec!["happy".to_string(), "sad".to_string()]);
+        assert_eq!(
+            map_pg_type("mood", &enums),
+            TypeCategory::Enum { values: vec!["happy".to_string(), "sad".to_string()] }
+        );
+    }
+
+    #[test]
+    fn falls_back_to_unsupported_for_unknown_types() {
+        assert_eq!(map("inet"), TypeCategory::Unsupported { native_type: "inet".to_string() });
+        assert_eq!(map("point"), TypeCategory::Unsupported { native_type: "point".to_string() });
+    }
+}
