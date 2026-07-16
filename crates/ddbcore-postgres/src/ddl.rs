@@ -1,0 +1,235 @@
+use ddbcore::{
+    ColumnDefinition, ConstraintDefinition, DdbCoreError, IndexDefinition, ReferentialAction,
+    Table, TableAlteration, TableDefinition, TypeCategory,
+};
+
+use crate::connection::PostgresConnection;
+use crate::util::{quote_ident, quote_qualified};
+
+fn db_err(e: sqlx::Error) -> DdbCoreError {
+    DdbCoreError::Ddl(e.to_string())
+}
+
+/// Maps a canonical `TypeCategory` to Postgres DDL syntax. Deliberately
+/// ignores `DataType::native_type` — a `Table` reflected from a different
+/// engine carries that engine's native type string, which would not be
+/// valid Postgres syntax. `Unsupported` is the one exception: there's
+/// nothing better to do than pass its raw string through as a best effort.
+fn category_to_pg_type(category: &TypeCategory) -> String {
+    match category {
+        TypeCategory::Boolean => "boolean".to_string(),
+        TypeCategory::SmallInt => "smallint".to_string(),
+        TypeCategory::Integer => "integer".to_string(),
+        TypeCategory::BigInt => "bigint".to_string(),
+        TypeCategory::Decimal { precision, scale } => match (precision, scale) {
+            (Some(p), Some(s)) => format!("numeric({p},{s})"),
+            (Some(p), None) => format!("numeric({p})"),
+            _ => "numeric".to_string(),
+        },
+        TypeCategory::Real => "real".to_string(),
+        TypeCategory::Double => "double precision".to_string(),
+        TypeCategory::Char { length } => format!("character({})", length.unwrap_or(1)),
+        TypeCategory::VarChar { length } => match length {
+            Some(l) => format!("character varying({l})"),
+            None => "character varying".to_string(),
+        },
+        TypeCategory::Text => "text".to_string(),
+        TypeCategory::Binary { .. } | TypeCategory::VarBinary { .. } | TypeCategory::Blob => "bytea".to_string(),
+        TypeCategory::Date => "date".to_string(),
+        TypeCategory::Time { precision } => match precision {
+            Some(p) => format!("time({p}) without time zone"),
+            None => "time without time zone".to_string(),
+        },
+        TypeCategory::Timestamp { precision, with_timezone } => {
+            let tz = if *with_timezone { "with time zone" } else { "without time zone" };
+            match precision {
+                Some(p) => format!("timestamp({p}) {tz}"),
+                None => format!("timestamp {tz}"),
+            }
+        }
+        TypeCategory::Interval => "interval".to_string(),
+        TypeCategory::Uuid => "uuid".to_string(),
+        TypeCategory::Json => "jsonb".to_string(),
+        TypeCategory::Xml => "xml".to_string(),
+        TypeCategory::Bit { length } => format!("bit({})", length.unwrap_or(1)),
+        // Native enum types need a prior CREATE TYPE ... AS ENUM; falling
+        // back to text keeps this a single-statement, dependency-free
+        // CREATE TABLE for v1.
+        TypeCategory::Enum { .. } => "text".to_string(),
+        TypeCategory::Array { element } => format!("{}[]", category_to_pg_type(element)),
+        // Needs PostGIS; not assumed to be installed.
+        TypeCategory::Geometry { .. } => "text".to_string(),
+        TypeCategory::Unsupported { native_type } => native_type.clone(),
+    }
+}
+
+fn referential_action_sql(action: &ReferentialAction) -> &'static str {
+    match action {
+        ReferentialAction::NoAction => "NO ACTION",
+        ReferentialAction::Restrict => "RESTRICT",
+        ReferentialAction::Cascade => "CASCADE",
+        ReferentialAction::SetNull => "SET NULL",
+        ReferentialAction::SetDefault => "SET DEFAULT",
+    }
+}
+
+fn column_def_sql(name: &str, native_sql_type: &str, nullable: bool, default: Option<&str>) -> String {
+    let mut sql = format!("{} {}", quote_ident(name), native_sql_type);
+    if !nullable {
+        sql.push_str(" NOT NULL");
+    }
+    if let Some(default) = default {
+        sql.push_str(&format!(" DEFAULT {default}"));
+    }
+    sql
+}
+
+/// Renders a reflected `Table` back into Postgres DDL: `CREATE TABLE` with
+/// inline primary key, followed by `CREATE INDEX` and `ALTER TABLE ADD
+/// CONSTRAINT` statements for everything else. Triggers/functions are not
+/// re-emitted here — their bodies are opaque per-engine text captured for
+/// reference, not something DDBCore can safely replay standalone.
+pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
+    let qualified = quote_qualified(&table.schema, &table.name);
+    let mut statements = Vec::new();
+
+    let mut column_lines: Vec<String> = table
+        .columns
+        .iter()
+        .map(|c| column_def_sql(&c.name, &category_to_pg_type(&c.data_type.category), c.nullable, c.default.as_deref()))
+        .collect();
+
+    if let Some(pk) = &table.primary_key {
+        let cols = pk.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        column_lines.push(format!("PRIMARY KEY ({cols})"));
+    }
+
+    statements.push(format!("CREATE TABLE {qualified} (\n  {}\n)", column_lines.join(",\n  ")));
+
+    for uc in &table.unique_constraints {
+        let cols = uc.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        statements.push(format!(
+            "ALTER TABLE {qualified} ADD CONSTRAINT {} UNIQUE ({cols})",
+            quote_ident(&uc.name)
+        ));
+    }
+
+    for cc in &table.check_constraints {
+        statements.push(format!(
+            "ALTER TABLE {qualified} ADD CONSTRAINT {} {}",
+            quote_ident(&cc.name),
+            cc.expression
+        ));
+    }
+
+    for fk in &table.foreign_keys {
+        let cols = fk.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let ref_qualified = quote_qualified(&fk.referenced_schema, &fk.referenced_table);
+        let ref_cols = fk.referenced_columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        statements.push(format!(
+            "ALTER TABLE {qualified} ADD CONSTRAINT {} FOREIGN KEY ({cols}) REFERENCES {ref_qualified} ({ref_cols}) ON UPDATE {} ON DELETE {}",
+            quote_ident(&fk.name),
+            referential_action_sql(&fk.on_update),
+            referential_action_sql(&fk.on_delete),
+        ));
+    }
+
+    for idx in &table.indexes {
+        let unique = if idx.unique { "UNIQUE " } else { "" };
+        let method = idx.method.as_deref().map(|m| format!(" USING {m}")).unwrap_or_default();
+        let cols = idx.columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
+        statements.push(format!(
+            "CREATE {unique}INDEX {}{method} ON {qualified} ({cols})",
+            quote_ident(&idx.name)
+        ));
+    }
+
+    Ok(statements.join(";\n\n") + ";")
+}
+
+pub(crate) async fn create_table(conn: &PostgresConnection, def: &TableDefinition) -> Result<(), DdbCoreError> {
+    let qualified = quote_qualified(&def.schema, &def.name);
+    let mut column_lines: Vec<String> = def
+        .columns
+        .iter()
+        .map(|c: &ColumnDefinition| column_def_sql(&c.name, &category_to_pg_type(&c.data_type.category), c.nullable, c.default.as_deref()))
+        .collect();
+
+    if let Some(pk) = &def.primary_key {
+        let cols = pk.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        column_lines.push(format!("PRIMARY KEY ({cols})"));
+    }
+
+    let sql = format!("CREATE TABLE {qualified} (\n  {}\n)", column_lines.join(",\n  "));
+    sqlx::query(&sql).execute(&conn.pool).await.map_err(db_err)?;
+    Ok(())
+}
+
+pub(crate) async fn create_index(conn: &PostgresConnection, def: &IndexDefinition) -> Result<(), DdbCoreError> {
+    let qualified = quote_qualified(&def.table.schema, &def.table.name);
+    let unique = if def.unique { "UNIQUE " } else { "" };
+    let method = def.method.as_deref().map(|m| format!(" USING {m}")).unwrap_or_default();
+    let cols = def.columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
+    let sql = format!("CREATE {unique}INDEX {}{method} ON {qualified} ({cols})", quote_ident(&def.name));
+    sqlx::query(&sql).execute(&conn.pool).await.map_err(db_err)?;
+    Ok(())
+}
+
+pub(crate) async fn alter_table(conn: &PostgresConnection, alteration: &TableAlteration) -> Result<(), DdbCoreError> {
+    let sql = match alteration {
+        TableAlteration::AddColumn { table, column } => {
+            format!(
+                "ALTER TABLE {} ADD COLUMN {}",
+                quote_qualified(&table.schema, &table.name),
+                column_def_sql(&column.name, &category_to_pg_type(&column.data_type.category), column.nullable, column.default.as_deref())
+            )
+        }
+        TableAlteration::DropColumn { table, column } => {
+            format!("ALTER TABLE {} DROP COLUMN {}", quote_qualified(&table.schema, &table.name), quote_ident(column))
+        }
+        TableAlteration::AlterColumnType { table, column, data_type } => {
+            format!(
+                "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
+                quote_qualified(&table.schema, &table.name),
+                quote_ident(column),
+                category_to_pg_type(&data_type.category)
+            )
+        }
+        TableAlteration::AddConstraint { table, constraint } => {
+            let qualified = quote_qualified(&table.schema, &table.name);
+            match constraint {
+                ConstraintDefinition::PrimaryKey(pk) => {
+                    let cols = pk.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+                    format!("ALTER TABLE {qualified} ADD PRIMARY KEY ({cols})")
+                }
+                ConstraintDefinition::ForeignKey(fk) => {
+                    let cols = fk.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+                    let ref_qualified = quote_qualified(&fk.referenced_schema, &fk.referenced_table);
+                    let ref_cols = fk.referenced_columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+                    format!(
+                        "ALTER TABLE {qualified} ADD CONSTRAINT {} FOREIGN KEY ({cols}) REFERENCES {ref_qualified} ({ref_cols}) ON UPDATE {} ON DELETE {}",
+                        quote_ident(&fk.name),
+                        referential_action_sql(&fk.on_update),
+                        referential_action_sql(&fk.on_delete),
+                    )
+                }
+                ConstraintDefinition::Unique(uc) => {
+                    let cols = uc.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+                    format!("ALTER TABLE {qualified} ADD CONSTRAINT {} UNIQUE ({cols})", quote_ident(&uc.name))
+                }
+                ConstraintDefinition::Check(cc) => {
+                    format!("ALTER TABLE {qualified} ADD CONSTRAINT {} {}", quote_ident(&cc.name), cc.expression)
+                }
+            }
+        }
+        TableAlteration::DropConstraint { table, name } => {
+            format!("ALTER TABLE {} DROP CONSTRAINT {}", quote_qualified(&table.schema, &table.name), quote_ident(name))
+        }
+        TableAlteration::DropIndex { table: _, name } => {
+            format!("DROP INDEX {}", quote_ident(name))
+        }
+    };
+
+    sqlx::query(&sql).execute(&conn.pool).await.map_err(db_err)?;
+    Ok(())
+}

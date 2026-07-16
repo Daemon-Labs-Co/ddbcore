@@ -1,0 +1,18 @@
+[package]
+name = "ddbcore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Engine-agnostic database reflection, streaming I/O, and DDL abstraction core"
+
+[dependencies]
+async-trait.workspace = true
+futures-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
