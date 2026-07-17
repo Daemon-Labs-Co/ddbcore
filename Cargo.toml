@@ -5,6 +5,7 @@ members = ["crates/ddbcore", "crates/ddbcore-postgres", "crates/ddbcore-mysql", 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.86"
 authors = ["Daemon Labs"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Daemon-Labs-Co/ddbcore"

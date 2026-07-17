@@ -28,12 +28,17 @@ pub enum TypeCategory {
     Blob,
 
     Date,
-    Time { precision: Option<u32> },
+    Time { precision: Option<u32>, with_timezone: bool },
     Timestamp { precision: Option<u32>, with_timezone: bool },
     Interval,
 
     Uuid,
-    Json,
+    /// `binary: true` for representations that normalize the document
+    /// (Postgres `jsonb`, MySQL `JSON` — key order and duplicate keys not
+    /// preserved); `false` for verbatim text storage (Postgres `json`).
+    /// Distinguished because copying `json` as `jsonb` silently rewrites
+    /// the stored bytes.
+    Json { binary: bool },
     Xml,
     Bit { length: Option<u32> },
 

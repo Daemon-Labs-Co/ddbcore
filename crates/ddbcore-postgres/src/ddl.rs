@@ -36,10 +36,13 @@ fn category_to_pg_type(category: &TypeCategory) -> String {
         TypeCategory::Text => "text".to_string(),
         TypeCategory::Binary { .. } | TypeCategory::VarBinary { .. } | TypeCategory::Blob => "bytea".to_string(),
         TypeCategory::Date => "date".to_string(),
-        TypeCategory::Time { precision } => match precision {
-            Some(p) => format!("time({p}) without time zone"),
-            None => "time without time zone".to_string(),
-        },
+        TypeCategory::Time { precision, with_timezone } => {
+            let tz = if *with_timezone { "with time zone" } else { "without time zone" };
+            match precision {
+                Some(p) => format!("time({p}) {tz}"),
+                None => format!("time {tz}"),
+            }
+        }
         TypeCategory::Timestamp { precision, with_timezone } => {
             let tz = if *with_timezone { "with time zone" } else { "without time zone" };
             match precision {
@@ -49,7 +52,8 @@ fn category_to_pg_type(category: &TypeCategory) -> String {
         }
         TypeCategory::Interval => "interval".to_string(),
         TypeCategory::Uuid => "uuid".to_string(),
-        TypeCategory::Json => "jsonb".to_string(),
+        TypeCategory::Json { binary: true } => "jsonb".to_string(),
+        TypeCategory::Json { binary: false } => "json".to_string(),
         TypeCategory::Xml => "xml".to_string(),
         TypeCategory::Bit { length } => format!("bit({})", length.unwrap_or(1)),
         // Native enum types need a prior CREATE TYPE ... AS ENUM; falling
@@ -151,6 +155,15 @@ pub(crate) fn render_ddl(table: &Table) -> Result<Vec<String>, DdbCoreError> {
             "ALTER TABLE {qualified} ADD CONSTRAINT {} CHECK ({})",
             quote_ident(&cc.name),
             cc.expression
+        ));
+    }
+
+    for xc in &table.exclusion_constraints {
+        // The definition is the engine's full `EXCLUDE USING ...` text.
+        statements.push(format!(
+            "ALTER TABLE {qualified} ADD CONSTRAINT {} {}",
+            quote_ident(&xc.name),
+            xc.definition
         ));
     }
 

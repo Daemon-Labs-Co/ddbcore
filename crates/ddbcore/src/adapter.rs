@@ -101,17 +101,16 @@ pub enum ParamStyle {
 impl Dialect {
     /// Quotes an identifier, doubling any embedded closing-quote character.
     pub fn quote_ident(&self, ident: &str) -> String {
-        let escaped: String = ident
-            .chars()
-            .flat_map(|c| {
-                if c == self.quote_close {
-                    vec![c, c]
-                } else {
-                    vec![c]
-                }
-            })
-            .collect();
-        format!("{}{}{}", self.quote_open, escaped, self.quote_close)
+        let mut out = String::with_capacity(ident.len() + 2);
+        out.push(self.quote_open);
+        for c in ident.chars() {
+            if c == self.quote_close {
+                out.push(c);
+            }
+            out.push(c);
+        }
+        out.push(self.quote_close);
+        out
     }
 
     pub fn quote_qualified(&self, schema: &str, name: &str) -> String {

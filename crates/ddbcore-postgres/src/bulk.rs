@@ -53,7 +53,7 @@ pub(crate) async fn bulk_write(conn: &PostgresConnection, table: &TableRef, mut 
     Ok(total)
 }
 
-fn write_copy_line(buffer: &mut String, row: &DdbRow) {
+pub(crate) fn write_copy_line(buffer: &mut String, row: &DdbRow) {
     for (i, value) in row.0.iter().enumerate() {
         if i > 0 {
             buffer.push('\t');
@@ -182,14 +182,24 @@ impl<W: fmt::Write> fmt::Write for ArrayElemEscaper<'_, W> {
     }
 }
 
+/// Span-scanning escape: most text contains none of the four COPY escape
+/// bytes, so clean spans are appended with one `push_str` instead of
+/// char-by-char. The escape bytes are all single-byte ASCII, so slicing
+/// at their positions always lands on UTF-8 boundaries.
 fn escape_copy_text(buffer: &mut String, s: &str) {
-    for ch in s.chars() {
-        match ch {
-            '\\' => buffer.push_str("\\\\"),
-            '\t' => buffer.push_str("\\t"),
-            '\n' => buffer.push_str("\\n"),
-            '\r' => buffer.push_str("\\r"),
-            c => buffer.push(c),
-        }
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escaped: &str = match b {
+            b'\\' => "\\\\",
+            b'\t' => "\\t",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        buffer.push_str(&s[start..i]);
+        buffer.push_str(escaped);
+        start = i + 1;
     }
+    buffer.push_str(&s[start..]);
 }
