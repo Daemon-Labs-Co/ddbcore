@@ -16,29 +16,43 @@ fn db_err(e: sqlx::Error) -> DdbCoreError {
 }
 
 pub(crate) async fn reflect_schema(conn: &PostgresConnection) -> Result<Catalog, DdbCoreError> {
-    let pool = &conn.pool;
-
     let schema_names: Vec<String> = sqlx::query_scalar(
         "SELECT schema_name FROM information_schema.schemata \
          WHERE schema_name NOT IN ('pg_catalog', 'information_schema') \
          AND schema_name NOT LIKE 'pg_toast%' AND schema_name NOT LIKE 'pg\\_temp\\_%' \
          ORDER BY schema_name",
     )
-    .fetch_all(pool)
+    .fetch_all(&conn.pool)
     .await
     .map_err(db_err)?;
 
     let mut schemas = Vec::with_capacity(schema_names.len());
     for schema_name in schema_names {
-        let enum_types = load_enum_types(pool, &schema_name).await?;
-        let tables = reflect_tables(pool, &schema_name, &enum_types).await?;
-        let views = reflect_views(pool, &schema_name, &enum_types).await?;
-        let sequences = reflect_sequences(pool, &schema_name).await?;
-        let functions = reflect_functions(pool, &schema_name).await?;
-        schemas.push(DdbSchema { name: schema_name, tables, views, sequences, functions });
+        schemas.push(reflect_schema_named(conn, &schema_name).await?);
     }
 
     Ok(Catalog { schemas })
+}
+
+/// Scoped reflection: one schema, without walking the rest of the catalog.
+pub(crate) async fn reflect_schema_named(conn: &PostgresConnection, schema: &str) -> Result<DdbSchema, DdbCoreError> {
+    let pool = &conn.pool;
+    let enum_types = load_enum_types(pool, schema).await?;
+    let tables = reflect_tables(pool, schema, None, &enum_types).await?;
+    let views = reflect_views(pool, schema, &enum_types).await?;
+    let sequences = reflect_sequences(pool, schema).await?;
+    let functions = reflect_functions(pool, schema).await?;
+    Ok(DdbSchema { name: schema.to_string(), tables, views, sequences, functions })
+}
+
+/// Scoped reflection: one table, without walking the rest of the catalog.
+pub(crate) async fn reflect_table(conn: &PostgresConnection, table: &TableRef) -> Result<Table, DdbCoreError> {
+    let pool = &conn.pool;
+    let enum_types = load_enum_types(pool, &table.schema).await?;
+    let mut tables = reflect_tables(pool, &table.schema, Some(&table.name), &enum_types).await?;
+    tables
+        .pop()
+        .ok_or_else(|| DdbCoreError::Reflection(format!("table {}.{} not found", table.schema, table.name)))
 }
 
 async fn load_enum_types(pool: &PgPool, schema: &str) -> Result<HashMap<String, Vec<String>>, DdbCoreError> {
@@ -67,13 +81,15 @@ async fn load_enum_types(pool: &PgPool, schema: &str) -> Result<HashMap<String, 
 async fn reflect_tables(
     pool: &PgPool,
     schema: &str,
+    only_table: Option<&str>,
     enum_types: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<Table>, DdbCoreError> {
     // relkind IN ('r','p'): partitioned parent tables are 'p', not 'r' —
     // excluding them silently reflects the wrong structure for any
     // partitioned database. Partition children carry their parent via
     // pg_inherits (only when relispartition, so plain inheritance isn't
-    // misreported as partitioning).
+    // misreported as partitioning). `only_table` scopes to one table for
+    // reflect_table without duplicating this query.
     let rows = sqlx::query(
         "SELECT c.relname, \
                 CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END AS partition_key, \
@@ -84,9 +100,11 @@ async fn reflect_tables(
          LEFT JOIN pg_inherits i ON i.inhrelid = c.oid \
          LEFT JOIN pg_class pc ON pc.oid = i.inhparent \
          LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
-         WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') ORDER BY c.relname",
+         WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') \
+         AND ($2::text IS NULL OR c.relname = $2) ORDER BY c.relname",
     )
     .bind(schema)
+    .bind(only_table)
     .fetch_all(pool)
     .await
     .map_err(db_err)?;

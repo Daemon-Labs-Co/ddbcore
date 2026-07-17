@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use ddbcore::{
     Catalog, Connection as DdbConnection, ConnectionConfig, DatabaseAdapter, DdbCoreError,
-    Dialect, EncryptionMode, IndexDefinition, ParamStyle, Row, RowStream, Table, TableAlteration,
-    TableDefinition, TableRef, Value,
+    Dialect, EncryptionMode, IndexDefinition, ParamStyle, Row, RowStream, Schema, StreamOptions,
+    Table, TableAlteration, TableDefinition, TableRef, Value,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 
@@ -66,8 +66,16 @@ impl DdbConnection for PostgresConnection {
         reflect::reflect_schema(self).await
     }
 
-    async fn stream_rows(&self, table: &TableRef, batch_size: usize) -> Result<RowStream, DdbCoreError> {
-        stream::stream_rows(self, table, batch_size).await
+    async fn reflect_schema_named(&self, schema: &str) -> Result<Schema, DdbCoreError> {
+        reflect::reflect_schema_named(self, schema).await
+    }
+
+    async fn reflect_table(&self, table: &TableRef) -> Result<Table, DdbCoreError> {
+        reflect::reflect_table(self, table).await
+    }
+
+    async fn stream_rows(&self, table: &TableRef, options: StreamOptions) -> Result<RowStream, DdbCoreError> {
+        stream::stream_rows(self, table, options).await
     }
 
     async fn bulk_write(&self, table: &TableRef, rows: RowStream) -> Result<u64, DdbCoreError> {
@@ -76,6 +84,10 @@ impl DdbConnection for PostgresConnection {
 
     async fn execute_query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DdbCoreError> {
         query::execute_query(self, sql, params).await
+    }
+
+    async fn execute_query_stream(&self, sql: &str, params: &[Value]) -> Result<RowStream, DdbCoreError> {
+        query::execute_query_stream(self, sql, params).await
     }
 
     async fn create_table(&self, def: &TableDefinition) -> Result<(), DdbCoreError> {
@@ -90,7 +102,7 @@ impl DdbConnection for PostgresConnection {
         ddl::alter_table(self, alteration).await
     }
 
-    fn render_ddl(&self, table: &Table) -> Result<String, DdbCoreError> {
+    fn render_ddl(&self, table: &Table) -> Result<Vec<String>, DdbCoreError> {
         ddl::render_ddl(table)
     }
 }

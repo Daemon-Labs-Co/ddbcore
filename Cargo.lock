@@ -584,7 +584,6 @@ dependencies = [
  "ddbcore",
  "ddbcore-testkit",
  "futures",
- "futures-core",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -600,12 +599,12 @@ dependencies = [
 name = "ddbcore-postgres"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "chrono",
  "ddbcore",
  "ddbcore-testkit",
  "futures",
- "futures-core",
  "rust_decimal",
  "serde",
  "serde_json",

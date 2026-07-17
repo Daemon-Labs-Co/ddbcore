@@ -99,11 +99,12 @@ fn column_def_sql(
     sql
 }
 
-/// Renders a reflected `Table` back into MySQL/MariaDB DDL. See the
-/// Postgres adapter's `render_ddl` for the overall shape — this mirrors
-/// it, swapping identifier quoting to backticks and using MySQL's
-/// `ALTER TABLE ADD CONSTRAINT` / `CREATE INDEX` syntax.
-pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
+/// Renders a reflected `Table` back into MySQL/MariaDB DDL, one statement
+/// per element (no trailing semicolons). See the Postgres adapter's
+/// `render_ddl` for the overall shape — this mirrors it, swapping
+/// identifier quoting to backticks and using MySQL's `ALTER TABLE ADD
+/// CONSTRAINT` / `CREATE INDEX` syntax.
+pub(crate) fn render_ddl(table: &Table) -> Result<Vec<String>, DdbCoreError> {
     let qualified = quote_qualified(&table.schema, &table.name);
     let mut statements = Vec::new();
 
@@ -147,7 +148,7 @@ pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
         statements.push(format!("CREATE {unique}INDEX {} ON {qualified} ({cols})", quote_ident(&idx.name)));
     }
 
-    Ok(statements.join(";\n\n") + ";")
+    Ok(statements)
 }
 
 pub(crate) async fn create_table(conn: &MySqlConnection, def: &TableDefinition) -> Result<(), DdbCoreError> {

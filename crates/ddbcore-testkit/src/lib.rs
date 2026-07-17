@@ -17,8 +17,9 @@ pub mod testenv;
 
 use ddbcore::{
     Catalog, Column, ColumnDefinition, Connection, ConstraintDefinition, DataType, ForeignKey,
-    IndexColumn, IndexDefinition, PrimaryKey, ReferentialAction, Row, RowStream, Table,
-    TableAlteration, TableDefinition, TableRef, TypeCategory, UniqueConstraint, Value,
+    IndexColumn, IndexDefinition, KeyRange, PrimaryKey, ReferentialAction, Row, RowStream,
+    StreamOptions, Table, TableAlteration, TableDefinition, TableRef, TypeCategory,
+    UniqueConstraint, Value,
 };
 use futures::stream::{self, StreamExt};
 
@@ -202,7 +203,10 @@ pub async fn bulk_write_stream_roundtrip(conn: &dyn Connection, schema: &str, pr
     // batch_size=2 deliberately smaller than the row count, so this also
     // exercises the multi-fetch path in `stream_rows`, not just the
     // single-batch case.
-    let mut result_stream = conn.stream_rows(&table_ref, 2).await.expect("stream_rows failed");
+    let mut result_stream = conn
+        .stream_rows(&table_ref, StreamOptions { batch_size: 2, ..Default::default() })
+        .await
+        .expect("stream_rows failed");
     let mut got = Vec::new();
     while let Some(row) = result_stream.next().await {
         got.push(row.expect("row decode failed"));
@@ -250,15 +254,15 @@ pub async fn render_ddl_recreates_table(conn: &dyn Connection, schema: &str, pre
     let catalog = conn.reflect_schema().await.expect("reflect_schema failed");
     let original_table = find_table(&catalog, schema, &original).expect("original table not found").clone();
 
-    let ddl = conn.render_ddl(&original_table).expect("render_ddl failed");
-    // Replace the bare table name rather than a quoted `"schema"."table"`
-    // form — identifier quoting differs per engine (double quotes vs
-    // backticks vs brackets), and the prefixed name is a unique token in
-    // the rendered DDL either way.
-    let renamed_ddl = ddl.replace(&original, &recreated);
-
-    for statement in renamed_ddl.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        conn.execute_query(statement, &[]).await.unwrap_or_else(|e| panic!("executing rendered DDL failed: {statement}: {e}"));
+    let statements = conn.render_ddl(&original_table).expect("render_ddl failed");
+    for statement in &statements {
+        // Replace the bare table name rather than a quoted
+        // `"schema"."table"` form — identifier quoting differs per engine
+        // (double quotes vs backticks vs brackets), and the prefixed name
+        // is a unique token in the rendered DDL either way. Statements are
+        // executed one by one as returned — never join-and-resplit on `;`.
+        let renamed = statement.replace(&original, &recreated);
+        conn.execute_query(&renamed, &[]).await.unwrap_or_else(|e| panic!("executing rendered DDL failed: {renamed}: {e}"));
     }
 
     let catalog2 = conn.reflect_schema().await.expect("reflect_schema failed");
@@ -287,6 +291,92 @@ pub async fn render_ddl_recreates_table(conn: &dyn Connection, schema: &str, pre
     cleanup(conn, schema, &[&recreated, &original]).await;
 }
 
+/// Column projection, key-range restriction, scoped reflection, and the
+/// streaming query variant must all behave identically across engines:
+/// projected streams return only the requested columns in the requested
+/// order; a half-open key range returns exactly the rows in `[lower,
+/// upper)`; `reflect_table` sees the same table `reflect_schema` would;
+/// `execute_query_stream` yields the same rows `execute_query` returns.
+pub async fn stream_options_and_scoped_reflection(conn: &dyn Connection, schema: &str, prefix: &str) {
+    let table = format!("{prefix}_opts");
+    cleanup(conn, schema, &[&table]).await;
+
+    conn.create_table(&TableDefinition {
+        schema: schema.into(),
+        name: table.clone(),
+        columns: vec![
+            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None, identity: None },
+            ColumnDefinition { name: "name".into(), data_type: dt(TypeCategory::Text), nullable: true, default: None, identity: None },
+        ],
+        primary_key: Some(PrimaryKey { name: None, columns: vec!["id".into()] }),
+    })
+    .await
+    .expect("create_table failed");
+
+    let table_ref = TableRef { schema: schema.into(), name: table.clone() };
+
+    let input: Vec<Row> = (1..=5).map(|i| Row(vec![Value::Integer(i), Value::Text(format!("row{i}"))])).collect();
+    let source: RowStream = Box::pin(stream::iter(input.into_iter().map(Ok)));
+    conn.bulk_write(&table_ref, source).await.expect("bulk_write failed");
+
+    // Scoped reflection sees the table without walking the catalog.
+    let reflected = conn.reflect_table(&table_ref).await.expect("reflect_table failed");
+    assert_eq!(reflected.name, table);
+    assert_eq!(reflected.columns.len(), 2);
+
+    // Projection: only `name`, so every row is a single Text value.
+    let mut projected = conn
+        .stream_rows(&table_ref, StreamOptions { columns: Some(vec!["name".into()]), ..Default::default() })
+        .await
+        .expect("projected stream_rows failed");
+    let mut projected_count = 0;
+    while let Some(row) = projected.next().await {
+        let row = row.expect("row decode failed");
+        assert_eq!(row.0.len(), 1, "projection must return exactly the requested columns");
+        assert!(matches!(row.0[0], Value::Text(_)), "projected column should be the text column");
+        projected_count += 1;
+    }
+    assert_eq!(projected_count, 5);
+
+    // Half-open key range [2, 4) selects ids 2 and 3.
+    let mut ranged = conn
+        .stream_rows(
+            &table_ref,
+            StreamOptions {
+                key_range: Some(KeyRange { column: "id".into(), lower: Some(Value::Integer(2)), upper: Some(Value::Integer(4)) }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ranged stream_rows failed");
+    let mut ids = Vec::new();
+    while let Some(row) = ranged.next().await {
+        match &row.expect("row decode failed").0[0] {
+            Value::Integer(id) => ids.push(*id),
+            other => panic!("expected integer id, got {other:?}"),
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![2, 3], "half-open key range [2,4) must select exactly ids 2 and 3");
+
+    // Zero batch_size must be rejected, not loop forever.
+    let zero = conn.stream_rows(&table_ref, StreamOptions { batch_size: 0, ..Default::default() }).await;
+    assert!(zero.is_err(), "batch_size 0 must be rejected");
+
+    // Streaming query variant yields the same row count as materialized.
+    let sql = format!("SELECT * FROM {}", conn.dialect().quote_qualified(schema, &table));
+    let materialized = conn.execute_query(&sql, &[]).await.expect("execute_query failed");
+    let mut streamed = conn.execute_query_stream(&sql, &[]).await.expect("execute_query_stream failed");
+    let mut streamed_count = 0;
+    while let Some(row) = streamed.next().await {
+        row.expect("streamed row decode failed");
+        streamed_count += 1;
+    }
+    assert_eq!(streamed_count, materialized.len(), "execute_query_stream must yield the same rows as execute_query");
+
+    cleanup(conn, schema, &[&table]).await;
+}
+
 /// Runs every contract test in sequence against the given connection. The
 /// per-engine crate can call this directly for a single all-in-one check,
 /// or call the individual functions above from separate `#[tokio::test]`s
@@ -296,4 +386,5 @@ pub async fn run_all(conn: &dyn Connection, schema: &str, prefix: &str) {
     constraints_and_index_roundtrip(conn, schema, &format!("{prefix}_b")).await;
     bulk_write_stream_roundtrip(conn, schema, &format!("{prefix}_c")).await;
     render_ddl_recreates_table(conn, schema, &format!("{prefix}_d")).await;
+    stream_options_and_scoped_reflection(conn, schema, &format!("{prefix}_e")).await;
 }

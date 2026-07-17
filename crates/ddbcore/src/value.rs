@@ -6,6 +6,13 @@ use uuid::Uuid;
 /// A single cell value, engine-agnostic. `stream_rows`, `bulk_write`, and
 /// `execute_query` params all move data around as `Value`, never as
 /// engine-native driver types.
+///
+/// Performance note: `Text`/`Binary`/`Json` heap-allocate per cell and
+/// `Row` allocates per row. This is a deliberate v1 simplicity/throughput
+/// tradeoff — network and decode dominate in practice — but it caps the
+/// ceiling below the theoretical COPY maximum. A batch-level,
+/// buffer-reusing transport may be added later alongside (not replacing)
+/// this representation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,

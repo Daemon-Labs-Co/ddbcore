@@ -64,3 +64,10 @@ async fn render_ddl_recreates_table() {
     let conn = PostgresAdapter.connect(&config).await.expect("connect failed");
     ddbcore_testkit::render_ddl_recreates_table(&*conn, "public", "ct_ddl").await;
 }
+
+#[tokio::test]
+async fn stream_options_and_scoped_reflection() {
+    let (_container, config) = start_postgres().await;
+    let conn = PostgresAdapter.connect(&config).await.expect("connect failed");
+    ddbcore_testkit::stream_options_and_scoped_reflection(&*conn, "public", "ct_opts").await;
+}

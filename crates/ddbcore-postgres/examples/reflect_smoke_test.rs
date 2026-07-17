@@ -1,4 +1,4 @@
-use ddbcore::{ConnectionConfig, DatabaseAdapter, EncryptionMode, TableRef};
+use ddbcore::{ConnectionConfig, DatabaseAdapter, EncryptionMode, StreamOptions, TableRef};
 use ddbcore_postgres::PostgresAdapter;
 use futures::StreamExt;
 
@@ -57,11 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flat_map(|s| &s.tables)
         .find(|t| t.name == "customers")
         .expect("customers table not found");
-    println!("{}", conn.render_ddl(customers)?);
+    println!("{}", conn.render_ddl(customers)?.join(";\n\n"));
 
     println!("\n=== stream_rows(customers) ===");
     let mut stream = conn
-        .stream_rows(&TableRef { schema: "public".into(), name: "customers".into() }, 1)
+        .stream_rows(&TableRef { schema: "public".into(), name: "customers".into() }, StreamOptions { batch_size: 1, ..Default::default() })
         .await?;
     let mut count = 0;
     while let Some(row) = stream.next().await {
@@ -72,11 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("streamed {count} rows");
 
     println!("\n=== bulk_write(customers -> customers_copy) ===");
-    let src = conn.stream_rows(&TableRef { schema: "public".into(), name: "customers".into() }, 100).await?;
+    let src = conn.stream_rows(&TableRef { schema: "public".into(), name: "customers".into() }, StreamOptions::default()).await?;
     let written = conn.bulk_write(&TableRef { schema: "public".into(), name: "customers_copy".into() }, src).await?;
     println!("bulk_write wrote {written} rows");
 
-    let mut verify = conn.stream_rows(&TableRef { schema: "public".into(), name: "customers_copy".into() }, 100).await?;
+    let mut verify = conn.stream_rows(&TableRef { schema: "public".into(), name: "customers_copy".into() }, StreamOptions::default()).await?;
     while let Some(row) = verify.next().await {
         println!("copy row: {:?}", row?.0);
     }

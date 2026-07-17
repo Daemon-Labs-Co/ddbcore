@@ -100,10 +100,11 @@ fn column_def_sql(
 
 /// Renders a reflected `Table` back into Postgres DDL: `CREATE TABLE` with
 /// inline primary key, followed by `CREATE INDEX` and `ALTER TABLE ADD
-/// CONSTRAINT` statements for everything else. Triggers/functions are not
-/// re-emitted here — their bodies are opaque per-engine text captured for
-/// reference, not something DDBCore can safely replay standalone.
-pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
+/// CONSTRAINT` statements for everything else, one statement per element
+/// (no trailing semicolons). Triggers/functions are not re-emitted here —
+/// their bodies are opaque per-engine text captured for reference, not
+/// something DDBCore can safely replay standalone.
+pub(crate) fn render_ddl(table: &Table) -> Result<Vec<String>, DdbCoreError> {
     let qualified = quote_qualified(&table.schema, &table.name);
     let mut statements = Vec::new();
 
@@ -175,7 +176,7 @@ pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
         ));
     }
 
-    Ok(statements.join(";\n\n") + ";")
+    Ok(statements)
 }
 
 pub(crate) async fn create_table(conn: &PostgresConnection, def: &TableDefinition) -> Result<(), DdbCoreError> {

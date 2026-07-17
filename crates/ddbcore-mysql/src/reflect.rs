@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use ddbcore::{
     Catalog, CheckConstraint, Column, DataType, DdbCoreError, ForeignKey, Function,
     FunctionArgument, IdentityGeneration, Index, IndexColumn, PrimaryKey, ReferentialAction,
-    Schema as DdbSchema, Sequence, Table, Trigger, TriggerEvent, TriggerTiming, UniqueConstraint,
-    View,
+    Schema as DdbSchema, Sequence, Table, TableRef, Trigger, TriggerEvent, TriggerTiming,
+    UniqueConstraint, View,
 };
 use sqlx::{MySqlPool, Row};
 
@@ -16,35 +16,50 @@ fn db_err(e: sqlx::Error) -> DdbCoreError {
 }
 
 pub(crate) async fn reflect_schema(conn: &MySqlConnection) -> Result<Catalog, DdbCoreError> {
-    let pool = &conn.pool;
-
     let schema_names: Vec<String> = sqlx::query_scalar(
         "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
          WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
          ORDER BY SCHEMA_NAME",
     )
-    .fetch_all(pool)
+    .fetch_all(&conn.pool)
     .await
     .map_err(db_err)?;
 
     let mut schemas = Vec::with_capacity(schema_names.len());
     for schema_name in schema_names {
-        let tables = reflect_tables(pool, &schema_name).await?;
-        let views = reflect_views(pool, &schema_name).await?;
-        let sequences = reflect_sequences(pool, &schema_name).await?;
-        let functions = reflect_functions(pool, &schema_name).await?;
-        schemas.push(DdbSchema { name: schema_name, tables, views, sequences, functions });
+        schemas.push(reflect_schema_named(conn, &schema_name).await?);
     }
 
     Ok(Catalog { schemas })
 }
 
-async fn reflect_tables(pool: &MySqlPool, schema: &str) -> Result<Vec<Table>, DdbCoreError> {
+/// Scoped reflection: one schema, without walking the rest of the catalog.
+pub(crate) async fn reflect_schema_named(conn: &MySqlConnection, schema: &str) -> Result<DdbSchema, DdbCoreError> {
+    let pool = &conn.pool;
+    let tables = reflect_tables(pool, schema, None).await?;
+    let views = reflect_views(pool, schema).await?;
+    let sequences = reflect_sequences(pool, schema).await?;
+    let functions = reflect_functions(pool, schema).await?;
+    Ok(DdbSchema { name: schema.to_string(), tables, views, sequences, functions })
+}
+
+/// Scoped reflection: one table, without walking the rest of the catalog.
+pub(crate) async fn reflect_table(conn: &MySqlConnection, table: &TableRef) -> Result<Table, DdbCoreError> {
+    let mut tables = reflect_tables(&conn.pool, &table.schema, Some(&table.name)).await?;
+    tables
+        .pop()
+        .ok_or_else(|| DdbCoreError::Reflection(format!("table {}.{} not found", table.schema, table.name)))
+}
+
+async fn reflect_tables(pool: &MySqlPool, schema: &str, only_table: Option<&str>) -> Result<Vec<Table>, DdbCoreError> {
     let rows = sqlx::query(
         "SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES \
-         WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME",
+         WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
+         AND (? IS NULL OR TABLE_NAME = ?) ORDER BY TABLE_NAME",
     )
     .bind(schema)
+    .bind(only_table)
+    .bind(only_table)
     .fetch_all(pool)
     .await
     .map_err(db_err)?;

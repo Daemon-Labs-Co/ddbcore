@@ -13,14 +13,15 @@ Rust has no equivalent of SQLAlchemy Core: a single API for reflecting a databas
 Everything downstream of `Connection` operates only against DDBCore's own canonical model — never against an engine's native types or SQL dialect:
 
 - **`TypeCategory`** (`crates/ddbcore/src/types.rs`) — a fixed set of type categories (integers, decimals, strings, temporal types, UUID, JSON, arrays, enums, ...) that every engine's native column types map into and back out of. `Unsupported { native_type }` is the escape hatch — reflection never silently drops a type it doesn't recognize.
-- **Canonical schema model** (`crates/ddbcore/src/schema.rs`) — `Catalog` → `Schema` → `Table`, with full `Column`, `PrimaryKey`, `ForeignKey`, `UniqueConstraint`, `CheckConstraint`, `Index`, `Trigger`, `Function`, `View`, and `Sequence` coverage. Reflection is meant to be exhaustive, not a subset.
+- **Canonical schema model** (`crates/ddbcore/src/schema.rs`) — `Catalog` → `Schema` → `Table`, with full `Column` (incl. identity), `PrimaryKey`, `ForeignKey`, `UniqueConstraint`, `CheckConstraint`, `Index`, `Trigger`, `Function`, `View`, `Sequence`, and partitioning coverage. Reflection is meant to be exhaustive, not a subset.
 - **`Connection` trait** (`crates/ddbcore/src/adapter.rs`) — implemented once per engine:
-  - `reflect_schema()` — walks the entire catalog visible to the connection's credentials
-  - `stream_rows(table, batch_size)` — cursor-backed, batched reads; a multi-hundred-million-row table never loads into memory at once
-  - `bulk_write(table, rows)` — the engine's fast bulk-load path (`COPY` for Postgres, `LOAD DATA` for MySQL, `BULK INSERT` for SQL Server, direct-path for Oracle), not row-by-row `INSERT`s
-  - `execute_query(sql, params)` — an escape hatch for arbitrary SQL
+  - `reflect_schema()` / `reflect_schema_named()` / `reflect_table()` — full-catalog or scoped reflection
+  - `stream_rows(table, options)` — cursor-backed batched reads with optional column projection and half-open key ranges (for running parallel non-overlapping sub-streams over one huge table); runs on a dedicated connection so multi-hour scans never pin a pool slot, and cancellation costs one reconnect
+  - `bulk_write(table, rows)` — the engine's fast bulk-load path (`COPY` for Postgres; batched, placeholder-capped, byte-budgeted multi-row `INSERT` for MySQL), never row-by-row
+  - `execute_query(sql, params)` / `execute_query_stream(...)` — ad-hoc SQL, materialized (small results) or streamed (large)
   - `create_table` / `create_index` / `alter_table` — user-config-driven DDL mutation
-  - `render_ddl(table)` — renders a reflected `Table` back into that engine's DDL
+  - `render_ddl(table)` — renders a reflected `Table` back into engine DDL, one statement per `Vec` element
+  - `dialect()` — the engine's quoting characters, parameter style, and capability flags, so generic callers can compose portable SQL without hardcoding any one engine's syntax
 
 `ConnectionConfig::encryption` defaults to clear-text (`EncryptionMode::ClearText`); TLS/SSL is opt-in per connection.
 
@@ -28,32 +29,43 @@ Everything downstream of `Connection` operates only against DDBCore's own canoni
 
 ```
 crates/
-  ddbcore/           canonical type system, schema model, Connection/DatabaseAdapter traits
-  ddbcore-postgres/  Postgres adapter (first engine implemented, proves the trait design)
+  ddbcore/           canonical type system, schema model, Connection/DatabaseAdapter traits, Dialect
+  ddbcore-postgres/  PostgreSQL adapter (sqlx; cursor streaming, COPY bulk writes)
+  ddbcore-mysql/     MySQL/MariaDB adapter (sqlx; socket streaming, batched-INSERT bulk writes)
   ddbcore-testkit/   engine-agnostic contract tests — same test code runs against any adapter
 ```
 
 ## Status
 
-Postgres adapter is implemented and verified end-to-end: reflect → render DDL → stream → bulk-write → verify, against a schema exercising foreign keys, unique/check constraints, indexes, a custom enum type, a trigger + function, a view, sequences, arrays, and JSONB.
+Postgres and MySQL/MariaDB adapters are implemented and verified end-to-end (reflect → render DDL → stream → bulk-write → verify) against real dockerized instances, including foreign keys, unique/check constraints, indexes, enums, triggers, views, sequences, identity columns, arrays (Postgres), JSON, column projection, and key-range streaming.
 
 **Known v1 gaps:**
 - Index column sort direction (ASC/DESC) isn't resolved from the catalog yet — always reports `false`
 - Enum-typed *array* columns error on decode rather than decoding (scalar enums work)
-- Function arguments are captured as one opaque signature string, not parsed per-parameter
+- Function arguments are captured as one opaque signature string (Postgres) or not at all (MySQL)
 - `TypeCategory::Enum` / `Geometry` render as `text` in Postgres DDL (no `CREATE TYPE`/PostGIS assumption)
-- Array parameter binding in `execute_query` isn't implemented yet
-- Only Postgres exists so far — MySQL, SQL Server, and Oracle adapters are not yet started
+- Array parameter binding in `execute_query` returns `Unsupported` (never silently NULLs)
+- MySQL partitioning is not reflected (Postgres declarative partitioning is)
+- SQL Server and Oracle adapters are not yet started
 
 ## Testing
 
 Two tiers:
 
-1. **Contract tests** (`ddbcore-testkit`) — engine-agnostic; talk to the database only through the `Connection` trait, so the same test code will run unmodified against every future adapter.
-2. **Integration tests** (`crates/ddbcore-postgres/tests/contract.rs`) — spin up a real, throwaway Postgres via [`testcontainers`](https://docs.rs/testcontainers) automatically and run the contract suite against it. No manually pre-started database required.
+1. **Contract tests** (`ddbcore-testkit`) — engine-agnostic; talk to the database only through the `Connection` trait (composing any hand-written SQL via `dialect()`), so the same test code runs unmodified against every adapter.
+2. **Integration tests** (each adapter's `tests/contract.rs`) — spin up a real, throwaway database via [`testcontainers`](https://docs.rs/testcontainers) automatically and run the contract suite against it. No manually pre-started database required.
+
+Container image tags and credentials live in **`.env.testing`** at the repo root — one source of truth shared by the cargo tests and `docker-compose.testing.yml`. Real environment variables override the file. To pre-pull all pinned images (or run long-lived local test databases):
 
 ```sh
-cargo test --workspace          # unit tests + Postgres integration tests (needs Docker)
+docker compose --env-file .env.testing -f docker-compose.testing.yml pull
+docker compose --env-file .env.testing -f docker-compose.testing.yml up -d
+```
+
+Run the tests:
+
+```sh
+cargo test --workspace          # unit tests + integration tests (needs Docker)
 cargo test --workspace --lib    # unit tests only, no Docker required
 ```
 

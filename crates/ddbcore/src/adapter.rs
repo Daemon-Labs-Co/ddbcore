@@ -3,7 +3,7 @@ use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::error::DdbCoreError;
-use crate::schema::{Catalog, CheckConstraint, ForeignKey, IdentityGeneration, IndexColumn, PrimaryKey, Table, TableRef, UniqueConstraint};
+use crate::schema::{Catalog, CheckConstraint, ForeignKey, IdentityGeneration, IndexColumn, PrimaryKey, Schema, Table, TableRef, UniqueConstraint};
 use crate::types::DataType;
 use crate::value::{Row, Value};
 
@@ -35,6 +35,41 @@ pub struct ConnectionConfig {
 /// A stream of rows, in table-column order. Backed by a server-side cursor
 /// in every adapter — never materializes a full table in memory.
 pub type RowStream = BoxStream<'static, Result<Row, DdbCoreError>>;
+
+/// Options for `Connection::stream_rows`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOptions {
+    /// Fetch granularity hint: rows per server round-trip where the
+    /// engine supports batched cursor reads (Postgres `FETCH FORWARD`).
+    /// Adapters whose drivers already stream row-by-row off the socket
+    /// (MySQL) may ignore it. Must be >= 1.
+    pub batch_size: usize,
+    /// Project only these columns, in this order, instead of every column
+    /// in the table. `None` streams all columns in table order.
+    pub columns: Option<Vec<String>>,
+    /// Restrict the scan to a key range. This is what enables intra-table
+    /// read parallelism: a caller can partition a huge table by key and
+    /// run several non-overlapping sub-streams concurrently.
+    pub key_range: Option<KeyRange>,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        Self { batch_size: 1000, columns: None, key_range: None }
+    }
+}
+
+/// A half-open key range: `column >= lower AND column < upper`, with
+/// either bound optional. Half-open ranges tile a table with no overlap
+/// and no gaps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRange {
+    pub column: String,
+    /// Inclusive lower bound (`column >= lower`).
+    pub lower: Option<Value>,
+    /// Exclusive upper bound (`column < upper`).
+    pub upper: Option<Value>,
+}
 
 /// Static description of an engine's SQL dialect and capabilities, so
 /// generic callers (the testkit, migration tooling, Readactus) can compose
@@ -173,12 +208,26 @@ pub trait Connection: Send + Sync {
     /// Walks the entire catalog visible to this connection's credentials
     /// and returns it as a `Catalog`. Must be exhaustive — every table,
     /// column, constraint, index, trigger, function, view, and sequence
-    /// the credential can see.
+    /// the credential can see. On very large catalogs prefer the scoped
+    /// variants below when only a subset is needed.
     async fn reflect_schema(&self) -> Result<Catalog, DdbCoreError>;
 
-    /// Cursor-backed batched read of every row in `table`, in column order
-    /// matching `Table::columns`.
-    async fn stream_rows(&self, table: &TableRef, batch_size: usize) -> Result<RowStream, DdbCoreError>;
+    /// Reflects a single named schema (namespace) without walking the
+    /// rest of the catalog.
+    async fn reflect_schema_named(&self, schema: &str) -> Result<Schema, DdbCoreError>;
+
+    /// Reflects a single table without walking the rest of the catalog.
+    async fn reflect_table(&self, table: &TableRef) -> Result<Table, DdbCoreError>;
+
+    /// Cursor-backed batched read of `table`, in column order matching
+    /// `Table::columns` (or `options.columns` order when projected).
+    ///
+    /// Runs on its own dedicated connection acquired for the stream's
+    /// lifetime and closed when the stream completes or is dropped — a
+    /// long-running scan never pins a shared pool slot, and dropping the
+    /// stream mid-way costs one reconnect, not a drain of the remaining
+    /// rows.
+    async fn stream_rows(&self, table: &TableRef, options: StreamOptions) -> Result<RowStream, DdbCoreError>;
 
     /// Writes `rows` into `table` using the engine's fastest bulk-load path
     /// (e.g. Postgres `COPY`), not row-by-row `INSERT`s. Returns the number
@@ -187,7 +236,16 @@ pub trait Connection: Send + Sync {
 
     /// Escape hatch for arbitrary SQL. Parameters are passed positionally
     /// and bound by the driver, never interpolated into the SQL string.
+    ///
+    /// The entire result set is materialized in memory — use this for
+    /// small results only. For large ad-hoc results use
+    /// `execute_query_stream`.
     async fn execute_query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DdbCoreError>;
+
+    /// Streaming variant of `execute_query` for large ad-hoc result sets:
+    /// rows are yielded as they arrive rather than materialized. Runs on a
+    /// dedicated connection like `stream_rows`.
+    async fn execute_query_stream(&self, sql: &str, params: &[Value]) -> Result<RowStream, DdbCoreError>;
 
     async fn create_table(&self, def: &TableDefinition) -> Result<(), DdbCoreError>;
     async fn create_index(&self, def: &IndexDefinition) -> Result<(), DdbCoreError>;
@@ -195,6 +253,9 @@ pub trait Connection: Send + Sync {
 
     /// Renders a reflected `Table` back into this engine's DDL — the
     /// counterpart to `reflect_schema`, used to recreate a table structure
-    /// on a target connection.
-    fn render_ddl(&self, table: &Table) -> Result<String, DdbCoreError>;
+    /// on a target connection. Returns one statement per element (no
+    /// trailing semicolons) so callers can execute them individually —
+    /// never join-and-resplit on `;`, which corrupts DDL containing
+    /// semicolons inside expressions.
+    fn render_ddl(&self, table: &Table) -> Result<Vec<String>, DdbCoreError>;
 }

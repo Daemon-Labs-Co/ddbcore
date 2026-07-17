@@ -1,8 +1,9 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use ddbcore::{DdbCoreError, Row as DdbRow, Value};
+use ddbcore::{DdbCoreError, Row as DdbRow, RowStream, Value};
+use futures::TryStreamExt;
 use rust_decimal::Decimal;
 use sqlx::postgres::PgRow;
-use sqlx::{Column as _, Row as _, TypeInfo};
+use sqlx::{Column as _, Connection as _, Row as _, TypeInfo};
 use uuid::Uuid;
 
 use crate::connection::PostgresConnection;
@@ -12,11 +13,7 @@ fn db_err(e: sqlx::Error) -> DdbCoreError {
 }
 
 pub(crate) async fn execute_query(conn: &PostgresConnection, sql: &str, params: &[Value]) -> Result<Vec<DdbRow>, DdbCoreError> {
-    // Refuse array params outright rather than silently binding NULL —
-    // writing NULL where the caller supplied data is corruption.
-    if params.iter().any(|p| matches!(p, Value::Array(_))) {
-        return Err(DdbCoreError::Unsupported("array parameter binding is not implemented yet".into()));
-    }
+    reject_array_params(params)?;
 
     let mut query = sqlx::query(sql);
     for param in params {
@@ -24,10 +21,52 @@ pub(crate) async fn execute_query(conn: &PostgresConnection, sql: &str, params: 
     }
 
     let rows = query.fetch_all(&conn.pool).await.map_err(db_err)?;
-    rows.iter().map(pg_row_to_row).collect()
+    let Some(first) = rows.first() else { return Ok(vec![]) };
+    let decoders = RowDecoder::for_row(first);
+    rows.iter().map(|row| decoders.decode(row)).collect()
 }
 
-fn bind_value<'q>(
+/// Streaming variant for large ad-hoc result sets: rows are yielded as
+/// they arrive off the wire. Runs on a dedicated (detached-from-pool)
+/// connection so a long-running result never pins a shared pool slot, and
+/// dropping the stream mid-way closes the socket rather than leaving the
+/// remainder to be drained by the next pool user.
+pub(crate) async fn execute_query_stream(conn: &PostgresConnection, sql: &str, params: &[Value]) -> Result<RowStream, DdbCoreError> {
+    reject_array_params(params)?;
+
+    let mut db = conn.pool.acquire().await.map_err(db_err)?.detach();
+    let sql = sql.to_string();
+    let params: Vec<Value> = params.to_vec();
+
+    let stream = async_stream::try_stream! {
+        {
+            let mut query = sqlx::query(&sql);
+            for param in &params {
+                query = bind_value(query, param);
+            }
+            let mut rows = query.fetch(&mut db).map_err(db_err);
+            let mut decoders: Option<RowDecoder> = None;
+            while let Some(row) = rows.try_next().await? {
+                let d = decoders.get_or_insert_with(|| RowDecoder::for_row(&row));
+                yield d.decode(&row)?;
+            }
+        }
+        let _ = db.close().await;
+    };
+
+    Ok(Box::pin(stream))
+}
+
+pub(crate) fn reject_array_params(params: &[Value]) -> Result<(), DdbCoreError> {
+    // Refuse array params outright rather than silently binding NULL —
+    // writing NULL where the caller supplied data is corruption.
+    if params.iter().any(|p| matches!(p, Value::Array(_))) {
+        return Err(DdbCoreError::Unsupported("array parameter binding is not implemented yet".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn bind_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     value: &'q Value,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
@@ -48,35 +87,128 @@ fn bind_value<'q>(
         Value::TimestampNaive(ts) => query.bind(ts),
         Value::Uuid(u) => query.bind(u),
         Value::Json(j) => query.bind(j),
-        // Unreachable: execute_query rejects array params before binding.
+        // Unreachable: callers reject array params before binding.
         Value::Array(_) => query.bind(None::<String>),
     }
 }
 
-/// Decodes a `PgRow` into a canonical `Row`, one `Value` per column. Known
-/// Postgres wire types decode into their matching `Value` variant; any
-/// native type this doesn't recognize falls back to a text decode rather
-/// than failing the whole row, since Postgres can represent almost
-/// anything (enums, network types, ranges, ...) in text form.
-pub(crate) fn pg_row_to_row(row: &PgRow) -> Result<DdbRow, DdbCoreError> {
-    let mut values = Vec::with_capacity(row.columns().len());
-    for (i, col) in row.columns().iter().enumerate() {
-        let type_name = col.type_info().name();
-        let value = decode_column(row, i, type_name)?;
-        values.push(value);
-    }
-    Ok(DdbRow(values))
+/// Per-column decode plan, built ONCE per result set from the first row's
+/// column metadata, then applied by index to every row. This replaces
+/// per-cell type-name string matching (and, for unknown types, a failing
+/// String decode retried as bytes) with a single upfront decision per
+/// column — on a 100M-row stream that removes ~1B redundant string
+/// comparisons from the hot path.
+pub(crate) struct RowDecoder(Vec<ColumnDecoder>);
+
+enum ColumnDecoder {
+    Bool,
+    I16,
+    I32,
+    I64,
+    Dec,
+    F32,
+    F64,
+    Str,
+    Bytes,
+    Date,
+    Time,
+    TsNaive,
+    TsUtc,
+    Uuid,
+    Json,
+    Array(ArrayKind),
+    /// Unknown wire type: try text, fall back to raw bytes — never
+    /// UTF-8-reinterpret binary data. (stream_rows avoids this entirely by
+    /// casting such columns to ::text server-side; this arm is reachable
+    /// only from ad-hoc execute_query SQL.)
+    Fallback,
 }
 
-fn decode_column(row: &PgRow, i: usize, type_name: &str) -> Result<Value, DdbCoreError> {
-    // Array columns (e.g. `TEXT[]`) must decode via `Vec<T>`, never via the
-    // scalar `T` path — the wire format is entirely different, and
-    // decoding array bytes as a scalar string silently produces garbage
-    // rather than an error, which is worse than failing loudly.
-    if let Some(elem_type) = type_name.strip_suffix("[]") {
-        return decode_array_column(row, i, elem_type);
+#[derive(Clone, Copy)]
+enum ArrayKind {
+    Bool,
+    I16,
+    I32,
+    I64,
+    Dec,
+    F32,
+    F64,
+    Str,
+    Date,
+    Time,
+    TsNaive,
+    TsUtc,
+    Uuid,
+    Json,
+    Unsupported,
+}
+
+impl RowDecoder {
+    pub(crate) fn for_row(row: &PgRow) -> Self {
+        let decoders = row
+            .columns()
+            .iter()
+            .map(|col| {
+                let type_name = col.type_info().name();
+                if let Some(elem) = type_name.strip_suffix("[]") {
+                    return ColumnDecoder::Array(array_kind(elem));
+                }
+                match type_name {
+                    "BOOL" => ColumnDecoder::Bool,
+                    "INT2" => ColumnDecoder::I16,
+                    "INT4" => ColumnDecoder::I32,
+                    "INT8" => ColumnDecoder::I64,
+                    "NUMERIC" => ColumnDecoder::Dec,
+                    "FLOAT4" => ColumnDecoder::F32,
+                    "FLOAT8" => ColumnDecoder::F64,
+                    "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CITEXT" => ColumnDecoder::Str,
+                    "BYTEA" => ColumnDecoder::Bytes,
+                    "DATE" => ColumnDecoder::Date,
+                    "TIME" => ColumnDecoder::Time,
+                    // TIMESTAMP (no timezone) must decode as naive —
+                    // stamping it UTC would silently change the data's
+                    // meaning. TIMESTAMPTZ genuinely carries an instant.
+                    "TIMESTAMP" => ColumnDecoder::TsNaive,
+                    "TIMESTAMPTZ" => ColumnDecoder::TsUtc,
+                    "UUID" => ColumnDecoder::Uuid,
+                    "JSON" | "JSONB" => ColumnDecoder::Json,
+                    _ => ColumnDecoder::Fallback,
+                }
+            })
+            .collect();
+        Self(decoders)
     }
 
+    pub(crate) fn decode(&self, row: &PgRow) -> Result<DdbRow, DdbCoreError> {
+        let mut values = Vec::with_capacity(self.0.len());
+        for (i, decoder) in self.0.iter().enumerate() {
+            values.push(decode_cell(row, i, decoder)?);
+        }
+        Ok(DdbRow(values))
+    }
+}
+
+fn array_kind(elem_type: &str) -> ArrayKind {
+    match elem_type {
+        "BOOL" => ArrayKind::Bool,
+        "INT2" => ArrayKind::I16,
+        "INT4" => ArrayKind::I32,
+        "INT8" => ArrayKind::I64,
+        "NUMERIC" => ArrayKind::Dec,
+        "FLOAT4" => ArrayKind::F32,
+        "FLOAT8" => ArrayKind::F64,
+        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CITEXT" => ArrayKind::Str,
+        "DATE" => ArrayKind::Date,
+        "TIME" => ArrayKind::Time,
+        "TIMESTAMP" => ArrayKind::TsNaive,
+        "TIMESTAMPTZ" => ArrayKind::TsUtc,
+        "UUID" => ArrayKind::Uuid,
+        "JSON" | "JSONB" => ArrayKind::Json,
+        _ => ArrayKind::Unsupported,
+    }
+}
+
+fn decode_cell(row: &PgRow, i: usize, decoder: &ColumnDecoder) -> Result<Value, DdbCoreError> {
     macro_rules! get {
         ($t:ty, $variant:expr) => {{
             let v: Option<$t> = row.try_get(i).map_err(db_err)?;
@@ -84,47 +216,34 @@ fn decode_column(row: &PgRow, i: usize, type_name: &str) -> Result<Value, DdbCor
         }};
     }
 
-    match type_name {
-        "BOOL" => get!(bool, Value::Boolean),
-        "INT2" => get!(i16, Value::SmallInt),
-        "INT4" => get!(i32, Value::Integer),
-        "INT8" => get!(i64, Value::BigInt),
-        "NUMERIC" => get!(Decimal, Value::Decimal),
-        "FLOAT4" => get!(f32, Value::Real),
-        "FLOAT8" => get!(f64, Value::Double),
-        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CITEXT" => get!(String, Value::Text),
-        "BYTEA" => get!(Vec<u8>, Value::Binary),
-        "DATE" => get!(NaiveDate, Value::Date),
-        "TIME" => get!(NaiveTime, Value::Time),
-        // TIMESTAMP (no timezone) must decode as naive — stamping it UTC
-        // would silently change the data's meaning. TIMESTAMPTZ genuinely
-        // carries an instant and decodes as DateTime<Utc>.
-        "TIMESTAMP" => get!(NaiveDateTime, Value::TimestampNaive),
-        "TIMESTAMPTZ" => get!(DateTime<Utc>, Value::Timestamp),
-        "UUID" => get!(Uuid, Value::Uuid),
-        "JSON" | "JSONB" => get!(serde_json::Value, Value::Json),
-        // Anything else: enums arrive as their label text and decode fine
-        // as String. Other exotic types (money, inet, ranges, intervals,
-        // geometrics) arrive in BINARY wire format under sqlx's prepared
-        // protocol — reinterpreting those bytes as a String is either an
-        // error or, worse, silent garbage that happens to be valid UTF-8.
-        // `stream_rows` avoids this entirely by casting such columns to
-        // ::text server-side; this path is only reachable via ad-hoc
-        // execute_query SQL. Try text first (enums), fall back to raw
-        // bytes as Binary — never UTF-8-reinterpret binary data.
-        _ => {
-            match row.try_get_unchecked::<Option<String>, _>(i) {
-                Ok(v) => Ok(v.map(Value::Text).unwrap_or(Value::Null)),
-                Err(_) => {
-                    let v: Option<Vec<u8>> = row.try_get_unchecked(i).map_err(db_err)?;
-                    Ok(v.map(Value::Binary).unwrap_or(Value::Null))
-                }
+    match decoder {
+        ColumnDecoder::Bool => get!(bool, Value::Boolean),
+        ColumnDecoder::I16 => get!(i16, Value::SmallInt),
+        ColumnDecoder::I32 => get!(i32, Value::Integer),
+        ColumnDecoder::I64 => get!(i64, Value::BigInt),
+        ColumnDecoder::Dec => get!(Decimal, Value::Decimal),
+        ColumnDecoder::F32 => get!(f32, Value::Real),
+        ColumnDecoder::F64 => get!(f64, Value::Double),
+        ColumnDecoder::Str => get!(String, Value::Text),
+        ColumnDecoder::Bytes => get!(Vec<u8>, Value::Binary),
+        ColumnDecoder::Date => get!(NaiveDate, Value::Date),
+        ColumnDecoder::Time => get!(NaiveTime, Value::Time),
+        ColumnDecoder::TsNaive => get!(NaiveDateTime, Value::TimestampNaive),
+        ColumnDecoder::TsUtc => get!(DateTime<Utc>, Value::Timestamp),
+        ColumnDecoder::Uuid => get!(Uuid, Value::Uuid),
+        ColumnDecoder::Json => get!(serde_json::Value, Value::Json),
+        ColumnDecoder::Array(kind) => decode_array_cell(row, i, *kind),
+        ColumnDecoder::Fallback => match row.try_get_unchecked::<Option<String>, _>(i) {
+            Ok(v) => Ok(v.map(Value::Text).unwrap_or(Value::Null)),
+            Err(_) => {
+                let v: Option<Vec<u8>> = row.try_get_unchecked(i).map_err(db_err)?;
+                Ok(v.map(Value::Binary).unwrap_or(Value::Null))
             }
-        }
+        },
     }
 }
 
-fn decode_array_column(row: &PgRow, i: usize, elem_type: &str) -> Result<Value, DdbCoreError> {
+fn decode_array_cell(row: &PgRow, i: usize, kind: ArrayKind) -> Result<Value, DdbCoreError> {
     macro_rules! get_vec {
         ($t:ty, $variant:expr) => {{
             let v: Option<Vec<Option<$t>>> = row.try_get(i).map_err(db_err)?;
@@ -133,25 +252,25 @@ fn decode_array_column(row: &PgRow, i: usize, elem_type: &str) -> Result<Value, 
         }};
     }
 
-    match elem_type {
-        "BOOL" => get_vec!(bool, Value::Boolean),
-        "INT2" => get_vec!(i16, Value::SmallInt),
-        "INT4" => get_vec!(i32, Value::Integer),
-        "INT8" => get_vec!(i64, Value::BigInt),
-        "NUMERIC" => get_vec!(Decimal, Value::Decimal),
-        "FLOAT4" => get_vec!(f32, Value::Real),
-        "FLOAT8" => get_vec!(f64, Value::Double),
-        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CITEXT" => get_vec!(String, Value::Text),
-        "DATE" => get_vec!(NaiveDate, Value::Date),
-        "TIME" => get_vec!(NaiveTime, Value::Time),
-        "TIMESTAMP" => get_vec!(NaiveDateTime, Value::TimestampNaive),
-        "TIMESTAMPTZ" => get_vec!(DateTime<Utc>, Value::Timestamp),
-        "UUID" => get_vec!(Uuid, Value::Uuid),
-        "JSON" | "JSONB" => get_vec!(serde_json::Value, Value::Json),
-        // Enum arrays and other exotic element types: sqlx has no built-in
-        // `Vec<T>` decode to fall back to via `try_get_unchecked` the way
-        // the scalar path does, so this remains a known gap rather than a
-        // silent-corruption risk — it errors instead of guessing.
-        other => Err(DdbCoreError::Query(format!("unsupported array element type: {other}[]"))),
+    match kind {
+        ArrayKind::Bool => get_vec!(bool, Value::Boolean),
+        ArrayKind::I16 => get_vec!(i16, Value::SmallInt),
+        ArrayKind::I32 => get_vec!(i32, Value::Integer),
+        ArrayKind::I64 => get_vec!(i64, Value::BigInt),
+        ArrayKind::Dec => get_vec!(Decimal, Value::Decimal),
+        ArrayKind::F32 => get_vec!(f32, Value::Real),
+        ArrayKind::F64 => get_vec!(f64, Value::Double),
+        ArrayKind::Str => get_vec!(String, Value::Text),
+        ArrayKind::Date => get_vec!(NaiveDate, Value::Date),
+        ArrayKind::Time => get_vec!(NaiveTime, Value::Time),
+        ArrayKind::TsNaive => get_vec!(NaiveDateTime, Value::TimestampNaive),
+        ArrayKind::TsUtc => get_vec!(DateTime<Utc>, Value::Timestamp),
+        ArrayKind::Uuid => get_vec!(Uuid, Value::Uuid),
+        ArrayKind::Json => get_vec!(serde_json::Value, Value::Json),
+        // Enum arrays and other exotic element types: errors rather than
+        // guessing — a silent-corruption risk is worse than a loud gap.
+        ArrayKind::Unsupported => {
+            Err(DdbCoreError::Query("unsupported array element type".to_string()))
+        }
     }
 }

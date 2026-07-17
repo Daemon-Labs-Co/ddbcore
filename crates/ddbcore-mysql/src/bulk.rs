@@ -18,12 +18,26 @@ fn db_err(e: sqlx::Error) -> DdbCoreError {
 /// inserts and is fully typed/parameterized rather than hand-serialized
 /// text, but it is a deliberate v1 simplification versus the Postgres
 /// adapter's true `COPY`-based path.
+///
+/// Batch size is bounded three ways:
+/// - target row count (500), keeping the SQL shape constant across full
+///   batches so sqlx's per-connection statement cache keeps hitting;
+/// - the MySQL protocol's hard u16 cap of 65,535 placeholders per
+///   prepared statement — without this, any table with >= 132 columns
+///   fails outright;
+/// - an estimated byte budget, so 500 rows of 16 MB blobs can't buffer
+///   gigabytes or blow past the server's max_allowed_packet (64 MB
+///   default).
 pub(crate) async fn bulk_write(conn: &MySqlConnection, table: &TableRef, mut rows: RowStream) -> Result<u64, DdbCoreError> {
-    const BATCH_SIZE: usize = 500;
+    const TARGET_ROWS: usize = 500;
+    const MAX_PLACEHOLDERS: usize = u16::MAX as usize;
+    const BYTE_BUDGET: usize = 8 << 20; // 8 MiB, well under max_allowed_packet
 
     let qualified = quote_qualified(&table.schema, &table.name);
     let mut total = 0u64;
-    let mut batch: Vec<DdbRow> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<DdbRow> = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut max_rows_per_batch = TARGET_ROWS;
 
     while let Some(row) = rows.next().await {
         let row = row?;
@@ -31,10 +45,19 @@ pub(crate) async fn bulk_write(conn: &MySqlConnection, table: &TableRef, mut row
         if row.0.iter().any(|v| matches!(v, Value::Array(_))) {
             return Err(DdbCoreError::Unsupported("MySQL has no array type; array values cannot be bulk-written".into()));
         }
+
+        if batch.is_empty() && total == 0 {
+            let cols = row.0.len().max(1);
+            max_rows_per_batch = TARGET_ROWS.min(MAX_PLACEHOLDERS / cols).max(1);
+        }
+
+        batch_bytes += estimated_row_bytes(&row);
         batch.push(row);
-        if batch.len() >= BATCH_SIZE {
+
+        if batch.len() >= max_rows_per_batch || batch_bytes >= BYTE_BUDGET {
             total += flush_batch(conn, &qualified, &batch).await?;
             batch.clear();
+            batch_bytes = 0;
         }
     }
     if !batch.is_empty() {
@@ -42,6 +65,24 @@ pub(crate) async fn bulk_write(conn: &MySqlConnection, table: &TableRef, mut row
     }
 
     Ok(total)
+}
+
+/// Rough per-row wire-size estimate: variable-size payloads at their
+/// actual length plus a fixed per-value overhead for everything else.
+/// Doesn't need to be exact — it only bounds batch memory.
+fn estimated_row_bytes(row: &DdbRow) -> usize {
+    row.0
+        .iter()
+        .map(|v| match v {
+            Value::Text(s) => s.len() + 16,
+            Value::Binary(b) => b.len() + 16,
+            Value::Json(j) => match j {
+                serde_json::Value::String(s) => s.len() + 32,
+                _ => 256,
+            },
+            _ => 16,
+        })
+        .sum()
 }
 
 async fn flush_batch(conn: &MySqlConnection, qualified_table: &str, batch: &[DdbRow]) -> Result<u64, DdbCoreError> {

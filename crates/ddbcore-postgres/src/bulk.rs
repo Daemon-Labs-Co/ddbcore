@@ -1,6 +1,8 @@
+use std::fmt::{self, Write as _};
+
 use ddbcore::{DdbCoreError, Row as DdbRow, RowStream, TableRef, Value};
 use futures::StreamExt;
-use sqlx::postgres::PgPoolCopyExt;
+use sqlx::Connection as _;
 
 use crate::connection::PostgresConnection;
 use crate::util::quote_qualified;
@@ -10,14 +12,20 @@ fn db_err(e: sqlx::Error) -> DdbCoreError {
 }
 
 /// Writes `rows` into `table` via Postgres `COPY ... FROM STDIN`, the
-/// engine's fast bulk-load path — not row-by-row `INSERT`s. Rows are
-/// pulled from the stream and flushed to the COPY sink in fixed-size
-/// chunks so a multi-hundred-million-row write stays bounded in memory.
+/// engine's fast bulk-load path. Rows are encoded into a buffer that is
+/// flushed on row count OR byte size, so both many-small-rows and
+/// few-huge-rows workloads stay bounded in memory.
+///
+/// The copy runs on a dedicated connection detached from the pool: a
+/// multi-hour bulk load never pins a shared pool slot.
 pub(crate) async fn bulk_write(conn: &PostgresConnection, table: &TableRef, mut rows: RowStream) -> Result<u64, DdbCoreError> {
-    const FLUSH_EVERY: usize = 10_000;
+    const FLUSH_EVERY_ROWS: usize = 10_000;
+    const FLUSH_EVERY_BYTES: usize = 1 << 20; // 1 MiB
 
     let sql = format!("COPY {} FROM STDIN WITH (FORMAT text)", quote_qualified(&table.schema, &table.name));
-    let mut copy = conn.pool.copy_in_raw(&sql).await.map_err(db_err)?;
+
+    let mut db = conn.pool.acquire().await.map_err(db_err)?.detach();
+    let mut copy = db.copy_in_raw(&sql).await.map_err(db_err)?;
 
     let mut buffer = String::new();
     let mut buffered_rows = 0usize;
@@ -29,7 +37,7 @@ pub(crate) async fn bulk_write(conn: &PostgresConnection, table: &TableRef, mut 
         buffered_rows += 1;
         total += 1;
 
-        if buffered_rows >= FLUSH_EVERY {
+        if buffered_rows >= FLUSH_EVERY_ROWS || buffer.len() >= FLUSH_EVERY_BYTES {
             copy.send(buffer.as_bytes()).await.map_err(db_err)?;
             buffer.clear();
             buffered_rows = 0;
@@ -41,6 +49,7 @@ pub(crate) async fn bulk_write(conn: &PostgresConnection, table: &TableRef, mut 
     }
 
     copy.finish().await.map_err(db_err)?;
+    let _ = db.close().await;
     Ok(total)
 }
 
@@ -54,59 +63,71 @@ fn write_copy_line(buffer: &mut String, row: &DdbRow) {
     buffer.push('\n');
 }
 
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn push_hex(out: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Result {
+    for b in bytes {
+        out.write_char(HEX[(b >> 4) as usize] as char)?;
+        out.write_char(HEX[(b & 0x0f) as usize] as char)?;
+    }
+    Ok(())
+}
+
 /// Encodes one value in Postgres COPY TEXT format: `\N` for NULL, and
 /// backslash/tab/newline/carriage-return escaped for everything else.
+///
+/// Everything writes DIRECTLY into `buffer` — no per-cell (or worse,
+/// per-byte) intermediate `String`s. This is the hottest path in a
+/// multi-TB copy; a 1B-row table passes through here 1B times.
 fn write_copy_value(buffer: &mut String, value: &Value) {
     match value {
         Value::Null => buffer.push_str("\\N"),
         Value::Text(s) => escape_copy_text(buffer, s),
-        Value::Json(j) => escape_copy_text(buffer, &j.to_string()),
+        // serde_json's Display writes compact JSON straight through the
+        // escaping adapter — no intermediate String.
+        Value::Json(j) => {
+            let _ = write!(CopyEscaper(buffer), "{j}");
+        }
         Value::Binary(b) => {
-            // COPY text sees `\x...`; the backslash needs COPY escaping.
+            // COPY text must see `\x...`; the backslash needs COPY escaping.
             buffer.push_str("\\\\x");
-            for byte in b {
-                buffer.push_str(&format!("{byte:02x}"));
-            }
+            let _ = push_hex(buffer, b);
         }
         Value::Array(items) => {
-            // Build the array literal first, then COPY-escape the whole
-            // thing — the literal's own quoting/escaping (`"…"`, `\"`,
-            // `\\`) must survive COPY's escaping layer intact.
-            let mut literal = String::new();
-            write_array_literal(&mut literal, items);
-            escape_copy_text(buffer, &literal);
+            // The array literal's own quoting (`"…"`, `\"`, `\\`) must
+            // survive COPY's escaping layer — writing through the escaper
+            // applies COPY escaping to the assembled literal on the fly.
+            let _ = write_array_literal(&mut CopyEscaper(buffer), items);
         }
-        scalar => buffer.push_str(&scalar_literal(scalar)),
+        scalar => {
+            let _ = write_plain_scalar(buffer, scalar);
+        }
     }
 }
 
-/// The plain text form of a scalar value (no COPY or array-literal
-/// escaping applied). Only called for variants that render as simple
-/// unquoted tokens plus Text/Binary/Json handled by callers.
-fn scalar_literal(value: &Value) -> String {
+/// Writes a scalar's plain text form (no COPY or array escaping). Integer
+/// and float formatting via `fmt::Write` uses stack buffers internally —
+/// zero heap allocation per cell.
+fn write_plain_scalar(w: &mut impl fmt::Write, value: &Value) -> fmt::Result {
     match value {
-        Value::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
-        Value::SmallInt(n) => n.to_string(),
-        Value::Integer(n) => n.to_string(),
-        Value::BigInt(n) => n.to_string(),
-        Value::Decimal(d) => d.to_string(),
-        Value::Real(f) => f.to_string(),
-        Value::Double(f) => f.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Boolean(b) => w.write_str(if *b { "t" } else { "f" }),
+        Value::SmallInt(n) => write!(w, "{n}"),
+        Value::Integer(n) => write!(w, "{n}"),
+        Value::BigInt(n) => write!(w, "{n}"),
+        Value::Decimal(d) => write!(w, "{d}"),
+        Value::Real(f) => write!(w, "{f}"),
+        Value::Double(f) => write!(w, "{f}"),
+        Value::Text(s) => w.write_str(s),
         Value::Binary(b) => {
-            let mut s = String::with_capacity(2 + b.len() * 2);
-            s.push_str("\\x");
-            for byte in b {
-                s.push_str(&format!("{byte:02x}"));
-            }
-            s
+            w.write_str("\\x")?;
+            push_hex(w, b)
         }
-        Value::Date(d) => d.to_string(),
-        Value::Time(t) => t.to_string(),
-        Value::Timestamp(ts) => ts.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string(),
-        Value::TimestampNaive(ts) => ts.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
-        Value::Uuid(u) => u.to_string(),
-        Value::Json(j) => j.to_string(),
+        Value::Date(d) => write!(w, "{d}"),
+        Value::Time(t) => write!(w, "{t}"),
+        Value::Timestamp(ts) => write!(w, "{}", ts.format("%Y-%m-%d %H:%M:%S%.f%:z")),
+        Value::TimestampNaive(ts) => write!(w, "{}", ts.format("%Y-%m-%d %H:%M:%S%.f")),
+        Value::Uuid(u) => write!(w, "{u}"),
+        Value::Json(j) => write!(w, "{j}"),
         Value::Null | Value::Array(_) => unreachable!("handled by callers"),
     }
 }
@@ -116,29 +137,49 @@ fn scalar_literal(value: &Value) -> String {
 /// `"` escaped, so elements containing `,`/`{`/`}`/whitespace/quotes
 /// cannot split or merge; NULL elements are the bare token `NULL` (an
 /// unquoted `\N` here would be the literal string "N").
-fn write_array_literal(out: &mut String, items: &[Value]) {
-    out.push('{');
+fn write_array_literal(w: &mut impl fmt::Write, items: &[Value]) -> fmt::Result {
+    w.write_char('{')?;
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
-            out.push(',');
+            w.write_char(',')?;
         }
         match item {
-            Value::Null => out.push_str("NULL"),
-            Value::Array(nested) => write_array_literal(out, nested),
+            Value::Null => w.write_str("NULL")?,
+            Value::Array(nested) => write_array_literal(w, nested)?,
             scalar => {
-                let text = scalar_literal(scalar);
-                out.push('"');
-                for ch in text.chars() {
-                    if ch == '"' || ch == '\\' {
-                        out.push('\\');
-                    }
-                    out.push(ch);
-                }
-                out.push('"');
+                w.write_char('"')?;
+                write_plain_scalar(&mut ArrayElemEscaper(w), scalar)?;
+                w.write_char('"')?;
             }
         }
     }
-    out.push('}');
+    w.write_char('}')
+}
+
+/// fmt::Write adapter applying COPY TEXT escaping on the fly.
+struct CopyEscaper<'a>(&'a mut String);
+
+impl fmt::Write for CopyEscaper<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        escape_copy_text(self.0, s);
+        Ok(())
+    }
+}
+
+/// fmt::Write adapter applying array-element escaping (`\` and `"`) on
+/// the fly, layered over whatever writer is underneath.
+struct ArrayElemEscaper<'a, W: fmt::Write>(&'a mut W);
+
+impl<W: fmt::Write> fmt::Write for ArrayElemEscaper<'_, W> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for ch in s.chars() {
+            if ch == '"' || ch == '\\' {
+                self.0.write_char('\\')?;
+            }
+            self.0.write_char(ch)?;
+        }
+        Ok(())
+    }
 }
 
 fn escape_copy_text(buffer: &mut String, s: &str) {
