@@ -5,20 +5,31 @@
 
 use ddbcore::{ConnectionConfig, DatabaseAdapter, EncryptionMode};
 use ddbcore_postgres::PostgresAdapter;
+use ddbcore_testkit::testenv;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
 async fn start_postgres() -> (ContainerAsync<Postgres>, ConnectionConfig) {
-    let container = Postgres::default().with_tag("16-alpine").start().await.expect("failed to start postgres container");
+    // Credentials are set explicitly on the container from .env.testing
+    // rather than relying on the testcontainers module's defaults, so the
+    // connection config below is guaranteed to match.
+    let container = Postgres::default()
+        .with_tag(testenv::pg_tag())
+        .with_env_var("POSTGRES_DB", testenv::pg_database())
+        .with_env_var("POSTGRES_USER", testenv::pg_user())
+        .with_env_var("POSTGRES_PASSWORD", testenv::pg_password())
+        .start()
+        .await
+        .expect("failed to start postgres container");
     let port = container.get_host_port_ipv4(5432).await.expect("failed to get mapped port");
 
     let config = ConnectionConfig {
         host: "127.0.0.1".into(),
         port,
-        database: "postgres".into(),
-        username: "postgres".into(),
-        password: "postgres".into(),
+        database: testenv::pg_database(),
+        username: testenv::pg_user(),
+        password: testenv::pg_password(),
         encryption: EncryptionMode::ClearText,
         read_only: false,
     };

@@ -1,0 +1,28 @@
+[package]
+name = "ddbcore-mysql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MySQL/MariaDB adapter for DDBCore"
+
+[dependencies]
+ddbcore.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+futures-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "mysql", "chrono", "uuid", "json", "rust_decimal"] }
+async-stream = "0.3.6"
+
+[dev-dependencies]
+ddbcore-testkit = { path = "../ddbcore-testkit" }
+testcontainers-modules = { version = "0.15.0", features = ["mariadb"] }

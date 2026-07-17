@@ -1,0 +1,27 @@
+# Long-lived local test databases for manual poking, and a one-shot way to
+# pre-pull all pinned test images (avoids Docker Hub auth failures mid-test):
+#
+#   docker compose --env-file .env.testing -f docker-compose.testing.yml pull
+#   docker compose --env-file .env.testing -f docker-compose.testing.yml up -d
+#
+# The cargo integration tests do NOT use this stack — they spin up their own
+# throwaway containers via testcontainers — but both read .env.testing, so
+# image versions and credentials stay in sync.
+
+services:
+  postgres:
+    image: postgres:${DDBCORE_TEST_PG_TAG}
+    environment:
+      POSTGRES_DB: ${DDBCORE_TEST_PG_DATABASE}
+      POSTGRES_USER: ${DDBCORE_TEST_PG_USER}
+      POSTGRES_PASSWORD: ${DDBCORE_TEST_PG_PASSWORD}
+    ports:
+      - "${DDBCORE_TEST_PG_HOST_PORT}:5432"
+
+  mariadb:
+    image: mariadb:${DDBCORE_TEST_MARIADB_TAG}
+    environment:
+      MARIADB_DATABASE: ${DDBCORE_TEST_MARIADB_DATABASE}
+      MARIADB_ROOT_PASSWORD: ${DDBCORE_TEST_MARIADB_ROOT_PASSWORD}
+    ports:
+      - "${DDBCORE_TEST_MARIADB_HOST_PORT}:3306"

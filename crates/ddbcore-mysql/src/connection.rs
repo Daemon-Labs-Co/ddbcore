@@ -4,22 +4,22 @@ use ddbcore::{
     Dialect, EncryptionMode, IndexDefinition, ParamStyle, Row, RowStream, Table, TableAlteration,
     TableDefinition, TableRef, Value,
 };
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 
 use crate::{bulk, ddl, query, reflect, stream};
 
-pub struct PostgresAdapter;
+pub struct MySqlAdapter;
 
 #[async_trait]
-impl DatabaseAdapter for PostgresAdapter {
+impl DatabaseAdapter for MySqlAdapter {
     async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn DdbConnection>, DdbCoreError> {
         let ssl_mode = match &config.encryption {
-            EncryptionMode::ClearText => PgSslMode::Disable,
-            EncryptionMode::Tls { verify_cert: true } => PgSslMode::VerifyFull,
-            EncryptionMode::Tls { verify_cert: false } => PgSslMode::Require,
+            EncryptionMode::ClearText => MySqlSslMode::Disabled,
+            EncryptionMode::Tls { verify_cert: true } => MySqlSslMode::VerifyIdentity,
+            EncryptionMode::Tls { verify_cert: false } => MySqlSslMode::Required,
         };
 
-        let mut options = PgConnectOptions::new()
+        let options = MySqlConnectOptions::new()
             .host(&config.host)
             .port(config.port)
             .database(&config.database)
@@ -27,39 +27,47 @@ impl DatabaseAdapter for PostgresAdapter {
             .password(&config.password)
             .ssl_mode(ssl_mode);
 
-        if config.read_only {
-            options = options.options([("default_transaction_read_only", "on")]);
-        }
-
-        let pool = PgPoolOptions::new()
+        let read_only = config.read_only;
+        let pool = MySqlPoolOptions::new()
             .max_connections(10)
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    if read_only {
+                        sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&mut *conn).await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await
             .map_err(|e| DdbCoreError::Connection(e.to_string()))?;
 
-        Ok(Box::new(PostgresConnection { pool }))
+        Ok(Box::new(MySqlConnection { pool }))
     }
 }
 
-pub struct PostgresConnection {
-    pub(crate) pool: PgPool,
+pub struct MySqlConnection {
+    pub(crate) pool: MySqlPool,
 }
 
-pub static POSTGRES_DIALECT: Dialect = Dialect {
-    name: "postgres",
-    quote_open: '"',
-    quote_close: '"',
-    param_style: ParamStyle::Dollar,
+pub static MYSQL_DIALECT: Dialect = Dialect {
+    name: "mysql",
+    quote_open: '`',
+    quote_close: '`',
+    param_style: ParamStyle::Question,
+    // MySQL "databases" serve as schemas; qualified names work the same way.
     supports_schemas: true,
-    supports_sequences: true,
-    supports_drop_table_cascade: true,
+    // MariaDB 10.3+ has sequences; plain MySQL does not. Flag conservatively.
+    supports_sequences: false,
+    // MySQL parses DROP TABLE ... CASCADE but ignores it; don't emit it.
+    supports_drop_table_cascade: false,
     supports_drop_if_exists: true,
 };
 
 #[async_trait]
-impl DdbConnection for PostgresConnection {
+impl DdbConnection for MySqlConnection {
     fn dialect(&self) -> &'static Dialect {
-        &POSTGRES_DIALECT
+        &MYSQL_DIALECT
     }
 
     async fn reflect_schema(&self) -> Result<Catalog, DdbCoreError> {

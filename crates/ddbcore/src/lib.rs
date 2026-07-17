@@ -6,7 +6,8 @@ pub mod value;
 
 pub use adapter::{
     ColumnDefinition, ConnectionConfig, Connection, ConstraintDefinition, DatabaseAdapter,
-    EncryptionMode, IndexDefinition, RowStream, TableAlteration, TableDefinition,
+    Dialect, EncryptionMode, IndexDefinition, ParamStyle, RowStream, TableAlteration,
+    TableDefinition,
 };
 pub use error::DdbCoreError;
 pub use schema::{

@@ -3,7 +3,7 @@ use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::error::DdbCoreError;
-use crate::schema::{Catalog, CheckConstraint, ForeignKey, IndexColumn, PrimaryKey, Table, TableRef, UniqueConstraint};
+use crate::schema::{Catalog, CheckConstraint, ForeignKey, IdentityGeneration, IndexColumn, PrimaryKey, Table, TableRef, UniqueConstraint};
 use crate::types::DataType;
 use crate::value::{Row, Value};
 
@@ -36,12 +36,83 @@ pub struct ConnectionConfig {
 /// in every adapter — never materializes a full table in memory.
 pub type RowStream = BoxStream<'static, Result<Row, DdbCoreError>>;
 
+/// Static description of an engine's SQL dialect and capabilities, so
+/// generic callers (the testkit, migration tooling, Readactus) can compose
+/// portable SQL without hardcoding any one engine's syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dialect {
+    pub name: &'static str,
+    /// Identifier quoting characters: `"` for Postgres/standard SQL,
+    /// `` ` `` for MySQL, `[`/`]` for SQL Server.
+    pub quote_open: char,
+    pub quote_close: char,
+    pub param_style: ParamStyle,
+    pub supports_schemas: bool,
+    pub supports_sequences: bool,
+    pub supports_drop_table_cascade: bool,
+    pub supports_drop_if_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamStyle {
+    /// `$1`, `$2`, ... (Postgres)
+    Dollar,
+    /// `?` positional (MySQL)
+    Question,
+    /// `@p1`, `@p2`, ... (SQL Server)
+    AtNumbered,
+}
+
+impl Dialect {
+    /// Quotes an identifier, doubling any embedded closing-quote character.
+    pub fn quote_ident(&self, ident: &str) -> String {
+        let escaped: String = ident
+            .chars()
+            .flat_map(|c| {
+                if c == self.quote_close {
+                    vec![c, c]
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        format!("{}{}{}", self.quote_open, escaped, self.quote_close)
+    }
+
+    pub fn quote_qualified(&self, schema: &str, name: &str) -> String {
+        if self.supports_schemas {
+            format!("{}.{}", self.quote_ident(schema), self.quote_ident(name))
+        } else {
+            self.quote_ident(name)
+        }
+    }
+
+    /// A best-effort `DROP TABLE` statement in this dialect, using
+    /// IF EXISTS / CASCADE only where supported.
+    pub fn drop_table_stmt(&self, schema: &str, name: &str) -> String {
+        let mut sql = String::from("DROP TABLE ");
+        if self.supports_drop_if_exists {
+            sql.push_str("IF EXISTS ");
+        }
+        sql.push_str(&self.quote_qualified(schema, name));
+        if self.supports_drop_table_cascade {
+            sql.push_str(" CASCADE");
+        }
+        sql
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub default: Option<String>,
+    /// Identity/auto-increment. When set, adapters emit the engine's
+    /// generated-key syntax (`GENERATED ... AS IDENTITY`, `AUTO_INCREMENT`)
+    /// and ignore `default` — losing this on a copied table breaks all
+    /// future inserts on the target.
+    pub identity: Option<IdentityGeneration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +165,11 @@ pub trait DatabaseAdapter: Send + Sync {
 /// perspective regardless of which engine is behind it.
 #[async_trait]
 pub trait Connection: Send + Sync {
+    /// This engine's SQL dialect and capability flags. Generic callers
+    /// must build any hand-composed SQL through this rather than assuming
+    /// one engine's quoting or feature set.
+    fn dialect(&self) -> &'static Dialect;
+
     /// Walks the entire catalog visible to this connection's credentials
     /// and returns it as a `Catalog`. Must be exhaustive — every table,
     /// column, constraint, index, trigger, function, view, and sequence

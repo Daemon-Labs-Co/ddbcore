@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use ddbcore::{DdbCoreError, Row as DdbRow, Value};
 use rust_decimal::Decimal;
 use sqlx::postgres::PgRow;
@@ -12,6 +12,12 @@ fn db_err(e: sqlx::Error) -> DdbCoreError {
 }
 
 pub(crate) async fn execute_query(conn: &PostgresConnection, sql: &str, params: &[Value]) -> Result<Vec<DdbRow>, DdbCoreError> {
+    // Refuse array params outright rather than silently binding NULL —
+    // writing NULL where the caller supplied data is corruption.
+    if params.iter().any(|p| matches!(p, Value::Array(_))) {
+        return Err(DdbCoreError::Unsupported("array parameter binding is not implemented yet".into()));
+    }
+
     let mut query = sqlx::query(sql);
     for param in params {
         query = bind_value(query, param);
@@ -39,9 +45,11 @@ fn bind_value<'q>(
         Value::Date(d) => query.bind(d),
         Value::Time(t) => query.bind(t),
         Value::Timestamp(ts) => query.bind(ts),
+        Value::TimestampNaive(ts) => query.bind(ts),
         Value::Uuid(u) => query.bind(u),
         Value::Json(j) => query.bind(j),
-        Value::Array(_) => query.bind(None::<String>), // array param binding not yet supported
+        // Unreachable: execute_query rejects array params before binding.
+        Value::Array(_) => query.bind(None::<String>),
     }
 }
 
@@ -88,19 +96,30 @@ fn decode_column(row: &PgRow, i: usize, type_name: &str) -> Result<Value, DdbCor
         "BYTEA" => get!(Vec<u8>, Value::Binary),
         "DATE" => get!(NaiveDate, Value::Date),
         "TIME" => get!(NaiveTime, Value::Time),
-        "TIMESTAMP" | "TIMESTAMPTZ" => get!(DateTime<Utc>, Value::Timestamp),
+        // TIMESTAMP (no timezone) must decode as naive — stamping it UTC
+        // would silently change the data's meaning. TIMESTAMPTZ genuinely
+        // carries an instant and decodes as DateTime<Utc>.
+        "TIMESTAMP" => get!(NaiveDateTime, Value::TimestampNaive),
+        "TIMESTAMPTZ" => get!(DateTime<Utc>, Value::Timestamp),
         "UUID" => get!(Uuid, Value::Uuid),
         "JSON" | "JSONB" => get!(serde_json::Value, Value::Json),
-        // Anything else (enums, inet/cidr/macaddr, ranges, geometric types,
-        // ...): fall back to a text decode rather than erroring the row
-        // out. `try_get_unchecked` is required here — sqlx's normal
-        // `try_get` refuses to decode a column whose declared Postgres
-        // type isn't one of String's known-compatible types (TEXT,
-        // VARCHAR, ...), even though the wire value is perfectly readable
-        // as text for things like enums.
+        // Anything else: enums arrive as their label text and decode fine
+        // as String. Other exotic types (money, inet, ranges, intervals,
+        // geometrics) arrive in BINARY wire format under sqlx's prepared
+        // protocol — reinterpreting those bytes as a String is either an
+        // error or, worse, silent garbage that happens to be valid UTF-8.
+        // `stream_rows` avoids this entirely by casting such columns to
+        // ::text server-side; this path is only reachable via ad-hoc
+        // execute_query SQL. Try text first (enums), fall back to raw
+        // bytes as Binary — never UTF-8-reinterpret binary data.
         _ => {
-            let v: Option<String> = row.try_get_unchecked(i).map_err(db_err)?;
-            Ok(v.map(Value::Text).unwrap_or(Value::Null))
+            match row.try_get_unchecked::<Option<String>, _>(i) {
+                Ok(v) => Ok(v.map(Value::Text).unwrap_or(Value::Null)),
+                Err(_) => {
+                    let v: Option<Vec<u8>> = row.try_get_unchecked(i).map_err(db_err)?;
+                    Ok(v.map(Value::Binary).unwrap_or(Value::Null))
+                }
+            }
         }
     }
 }
@@ -125,7 +144,8 @@ fn decode_array_column(row: &PgRow, i: usize, elem_type: &str) -> Result<Value, 
         "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CITEXT" => get_vec!(String, Value::Text),
         "DATE" => get_vec!(NaiveDate, Value::Date),
         "TIME" => get_vec!(NaiveTime, Value::Time),
-        "TIMESTAMP" | "TIMESTAMPTZ" => get_vec!(DateTime<Utc>, Value::Timestamp),
+        "TIMESTAMP" => get_vec!(NaiveDateTime, Value::TimestampNaive),
+        "TIMESTAMPTZ" => get_vec!(DateTime<Utc>, Value::Timestamp),
         "UUID" => get_vec!(Uuid, Value::Uuid),
         "JSON" | "JSONB" => get_vec!(serde_json::Value, Value::Json),
         // Enum arrays and other exotic element types: sqlx has no built-in

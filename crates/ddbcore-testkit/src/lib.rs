@@ -13,6 +13,8 @@
 //! meant to be called directly from a `#[tokio::test]` in the adapter
 //! crate under test.
 
+pub mod testenv;
+
 use ddbcore::{
     Catalog, Column, ColumnDefinition, Connection, ConstraintDefinition, DataType, ForeignKey,
     IndexColumn, IndexDefinition, PrimaryKey, ReferentialAction, Row, RowStream, Table,
@@ -32,13 +34,11 @@ fn find_column<'a>(table: &'a Table, name: &str) -> Option<&'a Column> {
     table.columns.iter().find(|c| c.name == name)
 }
 
-/// Best-effort cleanup via the `execute_query` escape hatch. `DROP TABLE
-/// IF EXISTS ... CASCADE` is not universal SQL (Oracle in particular has
-/// no `IF EXISTS`) — when a non-Postgres adapter is added, this will need
-/// an engine-specific override rather than being assumed portable.
+/// Best-effort cleanup composed through the adapter's own dialect — the
+/// testkit must never hardcode one engine's quoting or DROP syntax.
 async fn cleanup(conn: &dyn Connection, schema: &str, tables: &[&str]) {
     for table in tables {
-        let _ = conn.execute_query(&format!("DROP TABLE IF EXISTS \"{schema}\".\"{table}\" CASCADE"), &[]).await;
+        let _ = conn.execute_query(&conn.dialect().drop_table_stmt(schema, table), &[]).await;
     }
 }
 
@@ -52,9 +52,9 @@ pub async fn create_table_and_reflect_roundtrip(conn: &dyn Connection, schema: &
         schema: schema.to_string(),
         name: table_name.clone(),
         columns: vec![
-            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None },
-            ColumnDefinition { name: "label".into(), data_type: dt(TypeCategory::VarChar { length: Some(100) }), nullable: true, default: None },
-            ColumnDefinition { name: "is_active".into(), data_type: dt(TypeCategory::Boolean), nullable: false, default: Some("true".into()) },
+            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None, identity: None },
+            ColumnDefinition { name: "label".into(), data_type: dt(TypeCategory::VarChar { length: Some(100) }), nullable: true, default: None, identity: None },
+            ColumnDefinition { name: "is_active".into(), data_type: dt(TypeCategory::Boolean), nullable: false, default: Some("true".into()), identity: None },
         ],
         primary_key: Some(PrimaryKey { name: None, columns: vec!["id".into()] }),
     };
@@ -91,7 +91,7 @@ pub async fn constraints_and_index_roundtrip(conn: &dyn Connection, schema: &str
     conn.create_table(&TableDefinition {
         schema: schema.into(),
         name: parent.clone(),
-        columns: vec![ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None }],
+        columns: vec![ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None, identity: None }],
         primary_key: Some(PrimaryKey { name: None, columns: vec!["id".into()] }),
     })
     .await
@@ -101,9 +101,9 @@ pub async fn constraints_and_index_roundtrip(conn: &dyn Connection, schema: &str
         schema: schema.into(),
         name: child.clone(),
         columns: vec![
-            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None },
-            ColumnDefinition { name: "parent_id".into(), data_type: dt(TypeCategory::Integer), nullable: true, default: None },
-            ColumnDefinition { name: "code".into(), data_type: dt(TypeCategory::VarChar { length: Some(20) }), nullable: false, default: None },
+            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None, identity: None },
+            ColumnDefinition { name: "parent_id".into(), data_type: dt(TypeCategory::Integer), nullable: true, default: None, identity: None },
+            ColumnDefinition { name: "code".into(), data_type: dt(TypeCategory::VarChar { length: Some(20) }), nullable: false, default: None, identity: None },
         ],
         primary_key: Some(PrimaryKey { name: None, columns: vec!["id".into()] }),
     })
@@ -178,8 +178,8 @@ pub async fn bulk_write_stream_roundtrip(conn: &dyn Connection, schema: &str, pr
         schema: schema.into(),
         name: table.clone(),
         columns: vec![
-            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None },
-            ColumnDefinition { name: "name".into(), data_type: dt(TypeCategory::Text), nullable: true, default: None },
+            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::Integer), nullable: false, default: None, identity: None },
+            ColumnDefinition { name: "name".into(), data_type: dt(TypeCategory::Text), nullable: true, default: None, identity: None },
         ],
         primary_key: Some(PrimaryKey { name: None, columns: vec!["id".into()] }),
     })
@@ -219,7 +219,9 @@ pub async fn bulk_write_stream_roundtrip(conn: &dyn Connection, schema: &str, pr
 
 /// `render_ddl` on a reflected table must produce DDL that, when executed,
 /// recreates a structurally identical table — same columns, same
-/// canonical types, in the same order.
+/// canonical types, in the same order, with identity and unique
+/// constraints intact (identity loss breaks all future inserts on the
+/// target; unique-backing indexes must not be emitted twice).
 pub async fn render_ddl_recreates_table(conn: &dyn Connection, schema: &str, prefix: &str) {
     let original = format!("{prefix}_orig");
     let recreated = format!("{prefix}_recreated");
@@ -229,19 +231,31 @@ pub async fn render_ddl_recreates_table(conn: &dyn Connection, schema: &str, pre
         schema: schema.into(),
         name: original.clone(),
         columns: vec![
-            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::BigInt), nullable: false, default: None },
-            ColumnDefinition { name: "amount".into(), data_type: dt(TypeCategory::Decimal { precision: Some(10), scale: Some(2) }), nullable: true, default: None },
+            ColumnDefinition { name: "id".into(), data_type: dt(TypeCategory::BigInt), nullable: false, default: None, identity: Some(ddbcore::IdentityGeneration::ByDefault) },
+            ColumnDefinition { name: "amount".into(), data_type: dt(TypeCategory::Decimal { precision: Some(10), scale: Some(2) }), nullable: true, default: None, identity: None },
+            ColumnDefinition { name: "code".into(), data_type: dt(TypeCategory::VarChar { length: Some(20) }), nullable: false, default: None, identity: None },
         ],
         primary_key: Some(PrimaryKey { name: None, columns: vec!["id".into()] }),
     })
     .await
     .expect("create original table failed");
 
+    conn.alter_table(&TableAlteration::AddConstraint {
+        table: TableRef { schema: schema.into(), name: original.clone() },
+        constraint: ConstraintDefinition::Unique(UniqueConstraint { name: format!("{original}_code_uq"), columns: vec!["code".into()] }),
+    })
+    .await
+    .expect("add unique constraint failed");
+
     let catalog = conn.reflect_schema().await.expect("reflect_schema failed");
     let original_table = find_table(&catalog, schema, &original).expect("original table not found").clone();
 
     let ddl = conn.render_ddl(&original_table).expect("render_ddl failed");
-    let renamed_ddl = ddl.replace(&format!("\"{schema}\".\"{original}\""), &format!("\"{schema}\".\"{recreated}\""));
+    // Replace the bare table name rather than a quoted `"schema"."table"`
+    // form — identifier quoting differs per engine (double quotes vs
+    // backticks vs brackets), and the prefixed name is a unique token in
+    // the rendered DDL either way.
+    let renamed_ddl = ddl.replace(&original, &recreated);
 
     for statement in renamed_ddl.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         conn.execute_query(statement, &[]).await.unwrap_or_else(|e| panic!("executing rendered DDL failed: {statement}: {e}"));
@@ -254,7 +268,21 @@ pub async fn render_ddl_recreates_table(conn: &dyn Connection, schema: &str, pre
     for (orig_col, new_col) in original_table.columns.iter().zip(recreated_table.columns.iter()) {
         assert_eq!(orig_col.name, new_col.name, "column name mismatch after DDL replay");
         assert_eq!(orig_col.data_type.category, new_col.data_type.category, "column type mismatch after DDL replay");
+        assert_eq!(orig_col.is_identity, new_col.is_identity, "identity lost/gained on column {} after DDL replay", orig_col.name);
     }
+
+    let id_col = find_column(recreated_table, "id").expect("id column missing after replay");
+    assert!(id_col.is_identity, "identity column must survive render_ddl replay");
+
+    assert_eq!(
+        recreated_table.unique_constraints.len(),
+        original_table.unique_constraints.len(),
+        "unique constraint count mismatch after DDL replay"
+    );
+    assert!(
+        recreated_table.unique_constraints.iter().any(|u| u.columns == vec!["code".to_string()]),
+        "unique constraint on code lost after DDL replay"
+    );
 
     cleanup(conn, schema, &[&recreated, &original]).await;
 }

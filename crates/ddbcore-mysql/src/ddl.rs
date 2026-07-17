@@ -3,62 +3,66 @@ use ddbcore::{
     ReferentialAction, Table, TableAlteration, TableDefinition, TypeCategory,
 };
 
-use crate::connection::PostgresConnection;
+use crate::connection::MySqlConnection;
 use crate::util::{quote_ident, quote_qualified};
 
 fn db_err(e: sqlx::Error) -> DdbCoreError {
     DdbCoreError::Ddl(e.to_string())
 }
 
-/// Maps a canonical `TypeCategory` to Postgres DDL syntax. Deliberately
-/// ignores `DataType::native_type` — a `Table` reflected from a different
-/// engine carries that engine's native type string, which would not be
-/// valid Postgres syntax. `Unsupported` is the one exception: there's
-/// nothing better to do than pass its raw string through as a best effort.
-fn category_to_pg_type(category: &TypeCategory) -> String {
+/// Maps a canonical `TypeCategory` to MySQL/MariaDB DDL syntax. Like the
+/// Postgres adapter, this ignores `DataType::native_type` and works only
+/// from the category, so a table reflected from a different engine
+/// renders correctly here too.
+fn category_to_mysql_type(category: &TypeCategory) -> String {
     match category {
-        TypeCategory::Boolean => "boolean".to_string(),
+        TypeCategory::Boolean => "tinyint(1)".to_string(),
         TypeCategory::SmallInt => "smallint".to_string(),
-        TypeCategory::Integer => "integer".to_string(),
+        TypeCategory::Integer => "int".to_string(),
         TypeCategory::BigInt => "bigint".to_string(),
         TypeCategory::Decimal { precision, scale } => match (precision, scale) {
-            (Some(p), Some(s)) => format!("numeric({p},{s})"),
-            (Some(p), None) => format!("numeric({p})"),
-            _ => "numeric".to_string(),
+            (Some(p), Some(s)) => format!("decimal({p},{s})"),
+            (Some(p), None) => format!("decimal({p})"),
+            _ => "decimal".to_string(),
         },
-        TypeCategory::Real => "real".to_string(),
-        TypeCategory::Double => "double precision".to_string(),
-        TypeCategory::Char { length } => format!("character({})", length.unwrap_or(1)),
-        TypeCategory::VarChar { length } => match length {
-            Some(l) => format!("character varying({l})"),
-            None => "character varying".to_string(),
-        },
+        TypeCategory::Real => "float".to_string(),
+        TypeCategory::Double => "double".to_string(),
+        TypeCategory::Char { length } => format!("char({})", length.unwrap_or(1)),
+        // MySQL requires an explicit length for VARCHAR; 255 is the
+        // conventional default when none was captured.
+        TypeCategory::VarChar { length } => format!("varchar({})", length.unwrap_or(255)),
         TypeCategory::Text => "text".to_string(),
-        TypeCategory::Binary { .. } | TypeCategory::VarBinary { .. } | TypeCategory::Blob => "bytea".to_string(),
+        TypeCategory::Binary { length } => format!("binary({})", length.unwrap_or(1)),
+        TypeCategory::VarBinary { length } => format!("varbinary({})", length.unwrap_or(255)),
+        TypeCategory::Blob => "blob".to_string(),
         TypeCategory::Date => "date".to_string(),
         TypeCategory::Time { precision } => match precision {
-            Some(p) => format!("time({p}) without time zone"),
-            None => "time without time zone".to_string(),
+            Some(p) if *p > 0 => format!("time({p})"),
+            _ => "time".to_string(),
         },
-        TypeCategory::Timestamp { precision, with_timezone } => {
-            let tz = if *with_timezone { "with time zone" } else { "without time zone" };
-            match precision {
-                Some(p) => format!("timestamp({p}) {tz}"),
-                None => format!("timestamp {tz}"),
-            }
-        }
-        TypeCategory::Interval => "interval".to_string(),
-        TypeCategory::Uuid => "uuid".to_string(),
-        TypeCategory::Json => "jsonb".to_string(),
-        TypeCategory::Xml => "xml".to_string(),
+        // Always DATETIME, never TIMESTAMP — TIMESTAMP has MySQL-specific
+        // auto-update/timezone-conversion side effects that would silently
+        // change behavior on a recreated table.
+        TypeCategory::Timestamp { precision, .. } => match precision {
+            Some(p) if *p > 0 => format!("datetime({p})"),
+            _ => "datetime".to_string(),
+        },
+        // No native INTERVAL type in MySQL.
+        TypeCategory::Interval => "varchar(255)".to_string(),
+        // No native UUID type; char(36) is the common convention.
+        TypeCategory::Uuid => "char(36)".to_string(),
+        TypeCategory::Json => "json".to_string(),
+        // No native XML type.
+        TypeCategory::Xml => "text".to_string(),
         TypeCategory::Bit { length } => format!("bit({})", length.unwrap_or(1)),
-        // Native enum types need a prior CREATE TYPE ... AS ENUM; falling
-        // back to text keeps this a single-statement, dependency-free
-        // CREATE TABLE for v1.
-        TypeCategory::Enum { .. } => "text".to_string(),
-        TypeCategory::Array { element } => format!("{}[]", category_to_pg_type(element)),
-        // Needs PostGIS; not assumed to be installed.
-        TypeCategory::Geometry { .. } => "text".to_string(),
+        TypeCategory::Enum { values } => {
+            let quoted = values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+            format!("enum({quoted})")
+        }
+        // No native array type; JSON is the pragmatic fallback for
+        // structure, not a claim of equivalent query semantics.
+        TypeCategory::Array { .. } => "json".to_string(),
+        TypeCategory::Geometry { .. } => "geometry".to_string(),
         TypeCategory::Unsupported { native_type } => native_type.clone(),
     }
 }
@@ -84,25 +88,21 @@ fn column_def_sql(
     if !nullable {
         sql.push_str(" NOT NULL");
     }
-    // Identity and DEFAULT are mutually exclusive in Postgres; identity
-    // wins because dropping it breaks all future inserts on the target.
-    match identity {
-        Some(IdentityGeneration::Always) => sql.push_str(" GENERATED ALWAYS AS IDENTITY"),
-        Some(IdentityGeneration::ByDefault) => sql.push_str(" GENERATED BY DEFAULT AS IDENTITY"),
-        None => {
-            if let Some(default) = default {
-                sql.push_str(&format!(" DEFAULT {default}"));
-            }
-        }
+    // MySQL has one flavor of generated keys regardless of the canonical
+    // Always/ByDefault distinction. AUTO_INCREMENT and DEFAULT are
+    // mutually exclusive; identity wins.
+    if identity.is_some() {
+        sql.push_str(" AUTO_INCREMENT");
+    } else if let Some(default) = default {
+        sql.push_str(&format!(" DEFAULT {default}"));
     }
     sql
 }
 
-/// Renders a reflected `Table` back into Postgres DDL: `CREATE TABLE` with
-/// inline primary key, followed by `CREATE INDEX` and `ALTER TABLE ADD
-/// CONSTRAINT` statements for everything else. Triggers/functions are not
-/// re-emitted here — their bodies are opaque per-engine text captured for
-/// reference, not something DDBCore can safely replay standalone.
+/// Renders a reflected `Table` back into MySQL/MariaDB DDL. See the
+/// Postgres adapter's `render_ddl` for the overall shape — this mirrors
+/// it, swapping identifier quoting to backticks and using MySQL's
+/// `ALTER TABLE ADD CONSTRAINT` / `CREATE INDEX` syntax.
 pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
     let qualified = quote_qualified(&table.schema, &table.name);
     let mut statements = Vec::new();
@@ -110,15 +110,7 @@ pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
     let mut column_lines: Vec<String> = table
         .columns
         .iter()
-        .map(|c| {
-            column_def_sql(
-                &c.name,
-                &category_to_pg_type(&c.data_type.category),
-                c.nullable,
-                c.default.as_deref(),
-                c.identity_generation,
-            )
-        })
+        .map(|c| column_def_sql(&c.name, &category_to_mysql_type(&c.data_type.category), c.nullable, c.default.as_deref(), c.identity_generation))
         .collect();
 
     if let Some(pk) = &table.primary_key {
@@ -126,31 +118,15 @@ pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
         column_lines.push(format!("PRIMARY KEY ({cols})"));
     }
 
-    let partition_clause = table
-        .partition_key
-        .as_deref()
-        .map(|key| format!(" PARTITION BY {key}"))
-        .unwrap_or_default();
-
-    statements.push(format!(
-        "CREATE TABLE {qualified} (\n  {}\n){partition_clause}",
-        column_lines.join(",\n  ")
-    ));
+    statements.push(format!("CREATE TABLE {qualified} (\n  {}\n)", column_lines.join(",\n  ")));
 
     for uc in &table.unique_constraints {
         let cols = uc.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-        statements.push(format!(
-            "ALTER TABLE {qualified} ADD CONSTRAINT {} UNIQUE ({cols})",
-            quote_ident(&uc.name)
-        ));
+        statements.push(format!("ALTER TABLE {qualified} ADD CONSTRAINT {} UNIQUE ({cols})", quote_ident(&uc.name)));
     }
 
     for cc in &table.check_constraints {
-        statements.push(format!(
-            "ALTER TABLE {qualified} ADD CONSTRAINT {} CHECK ({})",
-            quote_ident(&cc.name),
-            cc.expression
-        ));
+        statements.push(format!("ALTER TABLE {qualified} ADD CONSTRAINT {} CHECK ({})", quote_ident(&cc.name), cc.expression));
     }
 
     for fk in &table.foreign_keys {
@@ -167,25 +143,19 @@ pub(crate) fn render_ddl(table: &Table) -> Result<String, DdbCoreError> {
 
     for idx in &table.indexes {
         let unique = if idx.unique { "UNIQUE " } else { "" };
-        let method = idx.method.as_deref().map(|m| format!(" USING {m}")).unwrap_or_default();
         let cols = idx.columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
-        statements.push(format!(
-            "CREATE {unique}INDEX {}{method} ON {qualified} ({cols})",
-            quote_ident(&idx.name)
-        ));
+        statements.push(format!("CREATE {unique}INDEX {} ON {qualified} ({cols})", quote_ident(&idx.name)));
     }
 
     Ok(statements.join(";\n\n") + ";")
 }
 
-pub(crate) async fn create_table(conn: &PostgresConnection, def: &TableDefinition) -> Result<(), DdbCoreError> {
+pub(crate) async fn create_table(conn: &MySqlConnection, def: &TableDefinition) -> Result<(), DdbCoreError> {
     let qualified = quote_qualified(&def.schema, &def.name);
     let mut column_lines: Vec<String> = def
         .columns
         .iter()
-        .map(|c: &ColumnDefinition| {
-            column_def_sql(&c.name, &category_to_pg_type(&c.data_type.category), c.nullable, c.default.as_deref(), c.identity)
-        })
+        .map(|c: &ColumnDefinition| column_def_sql(&c.name, &category_to_mysql_type(&c.data_type.category), c.nullable, c.default.as_deref(), c.identity))
         .collect();
 
     if let Some(pk) = &def.primary_key {
@@ -198,36 +168,31 @@ pub(crate) async fn create_table(conn: &PostgresConnection, def: &TableDefinitio
     Ok(())
 }
 
-pub(crate) async fn create_index(conn: &PostgresConnection, def: &IndexDefinition) -> Result<(), DdbCoreError> {
+pub(crate) async fn create_index(conn: &MySqlConnection, def: &IndexDefinition) -> Result<(), DdbCoreError> {
     let qualified = quote_qualified(&def.table.schema, &def.table.name);
     let unique = if def.unique { "UNIQUE " } else { "" };
-    let method = def.method.as_deref().map(|m| format!(" USING {m}")).unwrap_or_default();
     let cols = def.columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
-    let sql = format!("CREATE {unique}INDEX {}{method} ON {qualified} ({cols})", quote_ident(&def.name));
+    let sql = format!("CREATE {unique}INDEX {} ON {qualified} ({cols})", quote_ident(&def.name));
     sqlx::query(&sql).execute(&conn.pool).await.map_err(db_err)?;
     Ok(())
 }
 
-pub(crate) async fn alter_table(conn: &PostgresConnection, alteration: &TableAlteration) -> Result<(), DdbCoreError> {
+pub(crate) async fn alter_table(conn: &MySqlConnection, alteration: &TableAlteration) -> Result<(), DdbCoreError> {
     let sql = match alteration {
-        TableAlteration::AddColumn { table, column } => {
-            format!(
-                "ALTER TABLE {} ADD COLUMN {}",
-                quote_qualified(&table.schema, &table.name),
-                column_def_sql(&column.name, &category_to_pg_type(&column.data_type.category), column.nullable, column.default.as_deref(), column.identity)
-            )
-        }
+        TableAlteration::AddColumn { table, column } => format!(
+            "ALTER TABLE {} ADD COLUMN {}",
+            quote_qualified(&table.schema, &table.name),
+            column_def_sql(&column.name, &category_to_mysql_type(&column.data_type.category), column.nullable, column.default.as_deref(), column.identity)
+        ),
         TableAlteration::DropColumn { table, column } => {
             format!("ALTER TABLE {} DROP COLUMN {}", quote_qualified(&table.schema, &table.name), quote_ident(column))
         }
-        TableAlteration::AlterColumnType { table, column, data_type } => {
-            format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
-                quote_qualified(&table.schema, &table.name),
-                quote_ident(column),
-                category_to_pg_type(&data_type.category)
-            )
-        }
+        TableAlteration::AlterColumnType { table, column, data_type } => format!(
+            "ALTER TABLE {} MODIFY COLUMN {} {}",
+            quote_qualified(&table.schema, &table.name),
+            quote_ident(column),
+            category_to_mysql_type(&data_type.category)
+        ),
         TableAlteration::AddConstraint { table, constraint } => {
             let qualified = quote_qualified(&table.schema, &table.name);
             match constraint {
@@ -258,8 +223,10 @@ pub(crate) async fn alter_table(conn: &PostgresConnection, alteration: &TableAlt
         TableAlteration::DropConstraint { table, name } => {
             format!("ALTER TABLE {} DROP CONSTRAINT {}", quote_qualified(&table.schema, &table.name), quote_ident(name))
         }
-        TableAlteration::DropIndex { table: _, name } => {
-            format!("DROP INDEX {}", quote_ident(name))
+        // Unlike Postgres, MySQL requires naming the owning table when
+        // dropping an index.
+        TableAlteration::DropIndex { table, name } => {
+            format!("DROP INDEX {} ON {}", quote_ident(name), quote_qualified(&table.schema, &table.name))
         }
     };
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ddbcore", "crates/ddbcore-postgres", "crates/ddbcore-testkit"]
+members = ["crates/ddbcore", "crates/ddbcore-postgres", "crates/ddbcore-mysql", "crates/ddbcore-testkit"]
 
 [workspace.package]
 version = "0.1.0"

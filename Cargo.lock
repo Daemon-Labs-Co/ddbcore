@@ -575,6 +575,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ddbcore-mysql"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "ddbcore",
+ "ddbcore-testkit",
+ "futures",
+ "futures-core",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers-modules",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ddbcore-postgres"
 version = "0.1.0"
 dependencies = [

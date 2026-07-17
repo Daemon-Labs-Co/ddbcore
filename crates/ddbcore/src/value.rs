@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveTime, DateTime, Utc};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -20,7 +20,14 @@ pub enum Value {
     Binary(Vec<u8>),
     Date(NaiveDate),
     Time(NaiveTime),
+    /// A timestamp with an explicit UTC offset (`timestamptz` and
+    /// friends). Only decode into this when the engine actually stored an
+    /// offset-aware value.
     Timestamp(DateTime<Utc>),
+    /// A wall-clock timestamp with NO timezone (`timestamp without time
+    /// zone`, MySQL `DATETIME`). Kept distinct from `Timestamp` — stamping
+    /// naive values as UTC silently changes the data's meaning.
+    TimestampNaive(NaiveDateTime),
     Uuid(Uuid),
     Json(serde_json::Value),
     Array(Vec<Value>),

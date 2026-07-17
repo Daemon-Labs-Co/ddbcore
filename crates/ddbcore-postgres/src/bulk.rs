@@ -56,41 +56,89 @@ fn write_copy_line(buffer: &mut String, row: &DdbRow) {
 
 /// Encodes one value in Postgres COPY TEXT format: `\N` for NULL, and
 /// backslash/tab/newline/carriage-return escaped for everything else.
-/// Arrays are best-effort (`{...}` literal syntax) — nested arrays and
-/// values containing `,`/`{`/`}` are not escaped correctly yet.
 fn write_copy_value(buffer: &mut String, value: &Value) {
     match value {
         Value::Null => buffer.push_str("\\N"),
-        Value::Boolean(b) => buffer.push_str(if *b { "t" } else { "f" }),
-        Value::SmallInt(n) => buffer.push_str(&n.to_string()),
-        Value::Integer(n) => buffer.push_str(&n.to_string()),
-        Value::BigInt(n) => buffer.push_str(&n.to_string()),
-        Value::Decimal(d) => buffer.push_str(&d.to_string()),
-        Value::Real(f) => buffer.push_str(&f.to_string()),
-        Value::Double(f) => buffer.push_str(&f.to_string()),
         Value::Text(s) => escape_copy_text(buffer, s),
+        Value::Json(j) => escape_copy_text(buffer, &j.to_string()),
         Value::Binary(b) => {
+            // COPY text sees `\x...`; the backslash needs COPY escaping.
             buffer.push_str("\\\\x");
             for byte in b {
                 buffer.push_str(&format!("{byte:02x}"));
             }
         }
-        Value::Date(d) => buffer.push_str(&d.to_string()),
-        Value::Time(t) => buffer.push_str(&t.to_string()),
-        Value::Timestamp(ts) => buffer.push_str(&ts.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string()),
-        Value::Uuid(u) => buffer.push_str(&u.to_string()),
-        Value::Json(j) => escape_copy_text(buffer, &j.to_string()),
         Value::Array(items) => {
-            buffer.push('{');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    buffer.push(',');
-                }
-                write_copy_value(buffer, item);
+            // Build the array literal first, then COPY-escape the whole
+            // thing — the literal's own quoting/escaping (`"…"`, `\"`,
+            // `\\`) must survive COPY's escaping layer intact.
+            let mut literal = String::new();
+            write_array_literal(&mut literal, items);
+            escape_copy_text(buffer, &literal);
+        }
+        scalar => buffer.push_str(&scalar_literal(scalar)),
+    }
+}
+
+/// The plain text form of a scalar value (no COPY or array-literal
+/// escaping applied). Only called for variants that render as simple
+/// unquoted tokens plus Text/Binary/Json handled by callers.
+fn scalar_literal(value: &Value) -> String {
+    match value {
+        Value::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Double(f) => f.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Binary(b) => {
+            let mut s = String::with_capacity(2 + b.len() * 2);
+            s.push_str("\\x");
+            for byte in b {
+                s.push_str(&format!("{byte:02x}"));
             }
-            buffer.push('}');
+            s
+        }
+        Value::Date(d) => d.to_string(),
+        Value::Time(t) => t.to_string(),
+        Value::Timestamp(ts) => ts.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string(),
+        Value::TimestampNaive(ts) => ts.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+        Value::Uuid(u) => u.to_string(),
+        Value::Json(j) => j.to_string(),
+        Value::Null | Value::Array(_) => unreachable!("handled by callers"),
+    }
+}
+
+/// Renders a Postgres array literal (`{"a","b",NULL}`) with correct
+/// element quoting: every non-null element is double-quoted with `\` and
+/// `"` escaped, so elements containing `,`/`{`/`}`/whitespace/quotes
+/// cannot split or merge; NULL elements are the bare token `NULL` (an
+/// unquoted `\N` here would be the literal string "N").
+fn write_array_literal(out: &mut String, items: &[Value]) {
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            Value::Null => out.push_str("NULL"),
+            Value::Array(nested) => write_array_literal(out, nested),
+            scalar => {
+                let text = scalar_literal(scalar);
+                out.push('"');
+                for ch in text.chars() {
+                    if ch == '"' || ch == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out.push('"');
+            }
         }
     }
+    out.push('}');
 }
 
 fn escape_copy_text(buffer: &mut String, s: &str) {

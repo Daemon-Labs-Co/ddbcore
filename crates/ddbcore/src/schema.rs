@@ -40,6 +40,12 @@ pub struct Table {
     pub indexes: Vec<Index>,
     pub triggers: Vec<Trigger>,
     pub comment: Option<String>,
+    /// For partitioned parent tables: the engine's partition-key
+    /// definition (e.g. Postgres `RANGE (created_at)`). `None` for
+    /// ordinary tables and for engines without declarative partitioning.
+    pub partition_key: Option<String>,
+    /// For tables that are partitions of another table: the parent.
+    pub partition_parent: Option<TableRef>,
 }
 
 impl Table {
@@ -98,6 +104,10 @@ pub struct UniqueConstraint {
     pub columns: Vec<String>,
 }
 
+/// `expression` is the bare boolean expression WITHOUT any `CHECK (...)`
+/// wrapper — reflectors must strip engine framing, and renderers emit
+/// `CHECK ({expression})` themselves. This is the canonical contract; a
+/// wrapped expression here is an adapter bug.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckConstraint {
     pub name: String,

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use ddbcore::{
     Catalog, CheckConstraint, Column, DataType, DdbCoreError, ForeignKey, Function,
     FunctionArgument, IdentityGeneration, Index, IndexColumn, PrimaryKey, ReferentialAction,
-    Schema as DdbSchema, Sequence, Table, Trigger, TriggerEvent, TriggerTiming, UniqueConstraint,
-    View,
+    Schema as DdbSchema, Sequence, Table, TableRef, Trigger, TriggerEvent, TriggerTiming,
+    UniqueConstraint, View,
 };
 use sqlx::{PgPool, Row};
 
@@ -69,17 +69,39 @@ async fn reflect_tables(
     schema: &str,
     enum_types: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<Table>, DdbCoreError> {
-    let table_names: Vec<String> = sqlx::query_scalar(
-        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = $1 AND c.relkind = 'r' ORDER BY c.relname",
+    // relkind IN ('r','p'): partitioned parent tables are 'p', not 'r' —
+    // excluding them silently reflects the wrong structure for any
+    // partitioned database. Partition children carry their parent via
+    // pg_inherits (only when relispartition, so plain inheritance isn't
+    // misreported as partitioning).
+    let rows = sqlx::query(
+        "SELECT c.relname, \
+                CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END AS partition_key, \
+                CASE WHEN c.relispartition THEN pn.nspname END AS parent_schema, \
+                CASE WHEN c.relispartition THEN pc.relname END AS parent_name \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_inherits i ON i.inhrelid = c.oid \
+         LEFT JOIN pg_class pc ON pc.oid = i.inhparent \
+         LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+         WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') ORDER BY c.relname",
     )
     .bind(schema)
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
 
-    let mut tables = Vec::with_capacity(table_names.len());
-    for name in table_names {
+    let mut tables = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.try_get("relname").map_err(db_err)?;
+        let partition_key: Option<String> = row.try_get("partition_key").map_err(db_err)?;
+        let parent_schema: Option<String> = row.try_get("parent_schema").map_err(db_err)?;
+        let parent_name: Option<String> = row.try_get("parent_name").map_err(db_err)?;
+        let partition_parent = match (parent_schema, parent_name) {
+            (Some(schema), Some(name)) => Some(TableRef { schema, name }),
+            _ => None,
+        };
+
         let columns = reflect_columns(pool, schema, &name, enum_types).await?;
         let primary_key = reflect_primary_key(pool, schema, &name).await?;
         let foreign_keys = reflect_foreign_keys(pool, schema, &name).await?;
@@ -99,6 +121,8 @@ async fn reflect_tables(
             indexes,
             triggers,
             comment,
+            partition_key,
+            partition_parent,
         });
     }
     Ok(tables)
@@ -318,13 +342,25 @@ async fn reflect_check_constraints(pool: &PgPool, schema: &str, table: &str) -> 
     let mut constraints = Vec::with_capacity(rows.len());
     for row in rows {
         let name: String = row.try_get("conname").map_err(db_err)?;
-        let expression: String = row.try_get("definition").map_err(db_err)?;
+        let definition: String = row.try_get("definition").map_err(db_err)?;
+        // Canonical contract: `expression` is the bare boolean expression.
+        // pg_get_constraintdef returns "CHECK (...)" — strip the framing.
+        let expression = definition
+            .trim()
+            .strip_prefix("CHECK (")
+            .and_then(|s| s.strip_suffix(')'))
+            .map(str::to_string)
+            .unwrap_or(definition);
         constraints.push(CheckConstraint { name, expression });
     }
     Ok(constraints)
 }
 
 async fn reflect_indexes(pool: &PgPool, schema: &str, table: &str) -> Result<Vec<Index>, DdbCoreError> {
+    // The NOT EXISTS clause excludes indexes that back a constraint
+    // (unique/PK/exclusion) — those are already reflected as constraints,
+    // and reporting them again as plain indexes makes render_ddl emit two
+    // conflicting CREATE statements for the same object.
     let rows = sqlx::query(
         "SELECT ic.oid::bigint AS index_oid, ic.relname AS index_name, am.amname AS method, idx.indisunique AS is_unique \
          FROM pg_index idx \
@@ -333,6 +369,7 @@ async fn reflect_indexes(pool: &PgPool, schema: &str, table: &str) -> Result<Vec
          JOIN pg_namespace n ON n.oid = tc.relnamespace \
          JOIN pg_am am ON am.oid = ic.relam \
          WHERE n.nspname = $1 AND tc.relname = $2 AND NOT idx.indisprimary \
+         AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = idx.indexrelid) \
          ORDER BY ic.relname",
     )
     .bind(schema)
