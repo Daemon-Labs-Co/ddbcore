@@ -211,7 +211,15 @@ pub async fn bulk_write_stream_roundtrip(conn: &dyn Connection, schema: &str, pr
     while let Some(row) = result_stream.next().await {
         got.push(row.expect("row decode failed"));
     }
-    got.sort_by_key(|r| format!("{:?}", r.0.first()));
+    // Sort on the actual integer id — a debug-string sort would order
+    // Integer(10) before Integer(2) once the row count grows.
+    fn row_id(r: &Row) -> i32 {
+        match r.0.first() {
+            Some(Value::Integer(i)) => *i,
+            _ => i32::MAX,
+        }
+    }
+    got.sort_by_key(row_id);
 
     assert_eq!(got.len(), expected.len(), "row count mismatch after roundtrip");
     for (g, e) in got.iter().zip(expected.iter()) {

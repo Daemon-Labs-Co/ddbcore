@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use ddbcore::{
-    Catalog, CheckConstraint, Column, DataType, DdbCoreError, ForeignKey, Function,
-    FunctionArgument, IdentityGeneration, Index, IndexColumn, PrimaryKey, ReferentialAction,
-    Schema as DdbSchema, Sequence, Table, TableRef, Trigger, TriggerEvent, TriggerTiming,
-    UniqueConstraint, View,
+    Catalog, CheckConstraint, Column, DataType, DdbCoreError, ExclusionConstraint, ForeignKey,
+    Function, FunctionArgument, IdentityGeneration, Index, IndexColumn, PrimaryKey,
+    ReferentialAction, Schema as DdbSchema, Sequence, Table, TableRef, Trigger, TriggerEvent,
+    TriggerTiming, UniqueConstraint, View,
 };
 use sqlx::{PgPool, Row};
 
@@ -19,7 +19,7 @@ pub(crate) async fn reflect_schema(conn: &PostgresConnection) -> Result<Catalog,
     let schema_names: Vec<String> = sqlx::query_scalar(
         "SELECT schema_name FROM information_schema.schemata \
          WHERE schema_name NOT IN ('pg_catalog', 'information_schema') \
-         AND schema_name NOT LIKE 'pg_toast%' AND schema_name NOT LIKE 'pg\\_temp\\_%' \
+         AND schema_name NOT LIKE 'pg\\_toast%' AND schema_name NOT LIKE 'pg\\_temp\\_%' \
          ORDER BY schema_name",
     )
     .fetch_all(&conn.pool)
@@ -125,6 +125,7 @@ async fn reflect_tables(
         let foreign_keys = reflect_foreign_keys(pool, schema, &name).await?;
         let unique_constraints = reflect_unique_constraints(pool, schema, &name).await?;
         let check_constraints = reflect_check_constraints(pool, schema, &name).await?;
+        let exclusion_constraints = reflect_exclusion_constraints(pool, schema, &name).await?;
         let indexes = reflect_indexes(pool, schema, &name).await?;
         let triggers = reflect_triggers(pool, schema, &name).await?;
         let comment = reflect_table_comment(pool, schema, &name).await?;
@@ -136,6 +137,7 @@ async fn reflect_tables(
             foreign_keys,
             unique_constraints,
             check_constraints,
+            exclusion_constraints,
             indexes,
             triggers,
             comment,
@@ -370,6 +372,33 @@ async fn reflect_check_constraints(pool: &PgPool, schema: &str, table: &str) -> 
             .map(str::to_string)
             .unwrap_or(definition);
         constraints.push(CheckConstraint { name, expression });
+    }
+    Ok(constraints)
+}
+
+/// Exclusion constraints (`EXCLUDE USING ...`) have no cross-engine
+/// structure to normalize into; the full definition is captured verbatim
+/// so reflection stays exhaustive.
+async fn reflect_exclusion_constraints(pool: &PgPool, schema: &str, table: &str) -> Result<Vec<ExclusionConstraint>, DdbCoreError> {
+    let rows = sqlx::query(
+        "SELECT con.conname, pg_get_constraintdef(con.oid) AS definition \
+         FROM pg_constraint con \
+         JOIN pg_class rel ON rel.oid = con.conrelid \
+         JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace \
+         WHERE nsp.nspname = $1 AND rel.relname = $2 AND con.contype = 'x' \
+         ORDER BY con.conname",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    let mut constraints = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.try_get("conname").map_err(db_err)?;
+        let definition: String = row.try_get("definition").map_err(db_err)?;
+        constraints.push(ExclusionConstraint { name, definition });
     }
     Ok(constraints)
 }

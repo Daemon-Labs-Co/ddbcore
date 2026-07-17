@@ -33,16 +33,18 @@ pub fn map_pg_type(native: &str, enum_types: &std::collections::HashMap<String, 
         "text" => TypeCategory::Text,
         "bytea" => TypeCategory::Blob,
         "date" => TypeCategory::Date,
-        s if s.starts_with("time") && !s.starts_with("timestamp") => {
-            TypeCategory::Time { precision: parse_single_len(&args) }
-        }
+        s if s.starts_with("time") && !s.starts_with("timestamp") => TypeCategory::Time {
+            precision: parse_single_len(&args),
+            with_timezone: s.contains("with time zone"),
+        },
         s if s.starts_with("timestamp") => TypeCategory::Timestamp {
             precision: parse_single_len(&args),
             with_timezone: s.contains("with time zone"),
         },
         "interval" => TypeCategory::Interval,
         "uuid" => TypeCategory::Uuid,
-        "json" | "jsonb" => TypeCategory::Json,
+        "json" => TypeCategory::Json { binary: false },
+        "jsonb" => TypeCategory::Json { binary: true },
         "xml" => TypeCategory::Xml,
         s if s.starts_with("bit") => TypeCategory::Bit { length: parse_single_len(&args) },
         _ => TypeCategory::Unsupported { native_type: native.to_string() },
@@ -91,7 +93,8 @@ mod tests {
         assert_eq!(map("bigint"), TypeCategory::BigInt);
         assert_eq!(map("text"), TypeCategory::Text);
         assert_eq!(map("uuid"), TypeCategory::Uuid);
-        assert_eq!(map("jsonb"), TypeCategory::Json);
+        assert_eq!(map("json"), TypeCategory::Json { binary: false });
+        assert_eq!(map("jsonb"), TypeCategory::Json { binary: true });
     }
 
     #[test]
@@ -116,7 +119,8 @@ mod tests {
             map("timestamp(3) with time zone"),
             TypeCategory::Timestamp { precision: Some(3), with_timezone: true }
         );
-        assert_eq!(map("time without time zone"), TypeCategory::Time { precision: None });
+        assert_eq!(map("time without time zone"), TypeCategory::Time { precision: None, with_timezone: false });
+        assert_eq!(map("time with time zone"), TypeCategory::Time { precision: None, with_timezone: true });
     }
 
     #[test]

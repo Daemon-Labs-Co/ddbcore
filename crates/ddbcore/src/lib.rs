@@ -11,9 +11,9 @@ pub use adapter::{
 };
 pub use error::DdbCoreError;
 pub use schema::{
-    Catalog, CheckConstraint, Column, Function, FunctionArgument, ForeignKey, IdentityGeneration,
-    Index, IndexColumn, PrimaryKey, ReferentialAction, Schema, Sequence, Table, TableRef,
-    Trigger, TriggerEvent, TriggerTiming, UniqueConstraint, View,
+    Catalog, CheckConstraint, Column, ExclusionConstraint, Function, FunctionArgument, ForeignKey,
+    IdentityGeneration, Index, IndexColumn, PrimaryKey, ReferentialAction, Schema, Sequence,
+    Table, TableRef, Trigger, TriggerEvent, TriggerTiming, UniqueConstraint, View,
 };
 pub use types::{DataType, TypeCategory};
 pub use value::{Row, Value};

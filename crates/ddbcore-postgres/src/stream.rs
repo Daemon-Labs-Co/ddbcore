@@ -34,10 +34,12 @@ fn decodes_natively(category: &TypeCategory) -> bool {
         | TypeCategory::VarBinary { .. }
         | TypeCategory::Blob
         | TypeCategory::Date
-        | TypeCategory::Time { .. }
         | TypeCategory::Timestamp { .. }
         | TypeCategory::Uuid
-        | TypeCategory::Json => true,
+        | TypeCategory::Json { .. } => true,
+        // timetz has no NaiveTime decode — cast to ::text like other
+        // non-native types.
+        TypeCategory::Time { with_timezone, .. } => !with_timezone,
         TypeCategory::Array { element } => decodes_natively(element),
         _ => false,
     }

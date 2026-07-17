@@ -37,6 +37,7 @@ pub struct Table {
     pub foreign_keys: Vec<ForeignKey>,
     pub unique_constraints: Vec<UniqueConstraint>,
     pub check_constraints: Vec<CheckConstraint>,
+    pub exclusion_constraints: Vec<ExclusionConstraint>,
     pub indexes: Vec<Index>,
     pub triggers: Vec<Trigger>,
     pub comment: Option<String>,
@@ -112,6 +113,17 @@ pub struct UniqueConstraint {
 pub struct CheckConstraint {
     pub name: String,
     pub expression: String,
+}
+
+/// Postgres-style exclusion constraints (`EXCLUDE USING gist (...)`).
+/// The definition is the engine's full rendering (as from
+/// `pg_get_constraintdef`), captured verbatim rather than modeled —
+/// there's no cross-engine structure to normalize into, but reflection
+/// must not silently drop them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExclusionConstraint {
+    pub name: String,
+    pub definition: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

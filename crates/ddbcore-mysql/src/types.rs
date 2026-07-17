@@ -44,7 +44,8 @@ pub fn map_mysql_type(column_type: &str) -> TypeCategory {
         "varbinary" => TypeCategory::VarBinary { length: parse_single_len(&args) },
         "blob" | "tinyblob" | "mediumblob" | "longblob" => TypeCategory::Blob,
         "date" => TypeCategory::Date,
-        "time" => TypeCategory::Time { precision: parse_single_len(&args) },
+        // MySQL TIME never carries a timezone.
+        "time" => TypeCategory::Time { precision: parse_single_len(&args), with_timezone: false },
         // MySQL DATETIME/TIMESTAMP never carry an explicit UTC offset the
         // way Postgres's `timestamptz` does (TIMESTAMP is silently
         // converted to/from the session time zone instead), so both map
@@ -52,7 +53,9 @@ pub fn map_mysql_type(column_type: &str) -> TypeCategory {
         "datetime" | "timestamp" => TypeCategory::Timestamp { precision: parse_single_len(&args), with_timezone: false },
         // No Year category; Integer is the closest fit.
         "year" => TypeCategory::Integer,
-        "json" => TypeCategory::Json,
+        // MySQL JSON normalizes documents (duplicate keys removed, order
+        // not preserved) — semantically jsonb-like, hence binary: true.
+        "json" => TypeCategory::Json { binary: true },
         "bit" => TypeCategory::Bit { length: parse_single_len(&args) },
         "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon" | "geometrycollection" => {
             TypeCategory::Geometry { subtype: Some(name) }
@@ -103,7 +106,7 @@ mod tests {
         assert_eq!(map_mysql_type("int(11)"), TypeCategory::Integer);
         assert_eq!(map_mysql_type("bigint(20)"), TypeCategory::BigInt);
         assert_eq!(map_mysql_type("text"), TypeCategory::Text);
-        assert_eq!(map_mysql_type("json"), TypeCategory::Json);
+        assert_eq!(map_mysql_type("json"), TypeCategory::Json { binary: true });
     }
 
     #[test]

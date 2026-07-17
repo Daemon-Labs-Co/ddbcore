@@ -114,6 +114,12 @@ enum ColumnDecoder {
     F64,
     Str,
     Bytes,
+    /// BIT columns canonicalize to bit-string TEXT ("0101...") — matching
+    /// how the Postgres adapter surfaces bit columns (via ::text cast) so
+    /// the same TypeCategory::Bit yields the same Value shape on both
+    /// engines. Caveat: MySQL returns whole bytes, so BIT(5) renders 8
+    /// zero-padded chars where Postgres renders exactly 5.
+    BitText,
     Date,
     Time,
     TsNaive,
@@ -147,7 +153,8 @@ impl RowDecoder {
                 "FLOAT" => ColumnDecoder::F32,
                 "DOUBLE" => ColumnDecoder::F64,
                 "VARCHAR" | "CHAR" | "TEXT" | "VAR_STRING" | "STRING" | "ENUM" => ColumnDecoder::Str,
-                "BLOB" | "VARBINARY" | "BINARY" | "BIT" => ColumnDecoder::Bytes,
+                "BLOB" | "VARBINARY" | "BINARY" => ColumnDecoder::Bytes,
+                "BIT" => ColumnDecoder::BitText,
                 "DATE" => ColumnDecoder::Date,
                 "TIME" => ColumnDecoder::Time,
                 // Both DATETIME and TIMESTAMP arrive as wall-clock values
@@ -194,6 +201,19 @@ fn decode_cell(row: &MySqlRow, i: usize, decoder: &ColumnDecoder) -> Result<Valu
         ColumnDecoder::F64 => get!(f64, Value::Double),
         ColumnDecoder::Str => get!(String, Value::Text),
         ColumnDecoder::Bytes => get!(Vec<u8>, Value::Binary),
+        ColumnDecoder::BitText => {
+            let v: Option<Vec<u8>> = row.try_get(i).map_err(db_err)?;
+            Ok(v.map(|bytes| {
+                let mut s = String::with_capacity(bytes.len() * 8);
+                for byte in bytes {
+                    for bit in (0..8).rev() {
+                        s.push(if byte >> bit & 1 == 1 { '1' } else { '0' });
+                    }
+                }
+                Value::Text(s)
+            })
+            .unwrap_or(Value::Null))
+        }
         ColumnDecoder::Date => get!(NaiveDate, Value::Date),
         ColumnDecoder::Time => get!(NaiveTime, Value::Time),
         ColumnDecoder::TsNaive => get!(NaiveDateTime, Value::TimestampNaive),

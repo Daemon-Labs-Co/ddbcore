@@ -85,6 +85,8 @@ async fn reflect_tables(pool: &MySqlPool, schema: &str, only_table: Option<&str>
             foreign_keys,
             unique_constraints,
             check_constraints,
+            // MySQL has no exclusion constraints (Postgres-only feature).
+            exclusion_constraints: vec![],
             indexes,
             triggers,
             comment: if comment.is_empty() { None } else { Some(comment) },
@@ -396,7 +398,8 @@ async fn reflect_sequences(pool: &MySqlPool, schema: &str) -> Result<Vec<Sequenc
     let mut sequences = Vec::with_capacity(names.len());
     for name in names {
         let row = sqlx::query(&format!(
-            "SELECT min_value, max_value, start_value, increment, cycle_option FROM `{schema}`.`{name}`"
+            "SELECT min_value, max_value, start_value, increment, cycle_option FROM {}",
+            crate::util::quote_qualified(schema, &name)
         ))
         .fetch_one(pool)
         .await

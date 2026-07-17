@@ -1,6 +1,7 @@
 [package]
 name = "ddbcore-postgres"
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -22,6 +23,11 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 async-stream = "0.3.6"
 
 [dev-dependencies]
+criterion = "0.8.2"
 ddbcore-testkit = { path = "../ddbcore-testkit" }
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio.workspace = true
+
+[[bench]]
+name = "copy_encode"
+harness = false

@@ -36,7 +36,8 @@ fn category_to_mysql_type(category: &TypeCategory) -> String {
         TypeCategory::VarBinary { length } => format!("varbinary({})", length.unwrap_or(255)),
         TypeCategory::Blob => "blob".to_string(),
         TypeCategory::Date => "date".to_string(),
-        TypeCategory::Time { precision } => match precision {
+        // MySQL has no time-with-timezone; the tz attribute is dropped.
+        TypeCategory::Time { precision, .. } => match precision {
             Some(p) if *p > 0 => format!("time({p})"),
             _ => "time".to_string(),
         },
@@ -51,7 +52,7 @@ fn category_to_mysql_type(category: &TypeCategory) -> String {
         TypeCategory::Interval => "varchar(255)".to_string(),
         // No native UUID type; char(36) is the common convention.
         TypeCategory::Uuid => "char(36)".to_string(),
-        TypeCategory::Json => "json".to_string(),
+        TypeCategory::Json { .. } => "json".to_string(),
         // No native XML type.
         TypeCategory::Xml => "text".to_string(),
         TypeCategory::Bit { length } => format!("bit({})", length.unwrap_or(1)),
